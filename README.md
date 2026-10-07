@@ -239,6 +239,30 @@ the protobuf layer can be ignored entirely.
 Processes are supervised by `em-server` (HTTP API on `0.0.0.0:50080`), driven by
 `/agibot/software/entry/cfg/run_agibot.yaml`.
 
+### Making `aimdk_msgs` types usable
+
+By default `AMENT_PREFIX_PATH` is only `/opt/ros/humble`, so **no vendor message
+type resolves** and any tool touching them fails. A prebuilt ament tree fixes it:
+
+```bash
+AIMDK=/home/agi/aimdk/src/aimdk_msgs/prebuilt_aarch64
+export AMENT_PREFIX_PATH="$AIMDK:$AMENT_PREFIX_PATH"
+export LD_LIBRARY_PATH="$AIMDK/lib:$LD_LIBRARY_PATH"
+```
+
+**It is only a partial tree — 57 `.idl` files, not the full message set.**
+Verified behaviour:
+
+| Type | `ros2 interface show` | `.idl` present | Recordable |
+|---|---|---|---|
+| `aimdk_msgs/msg/JointStateArray` | OK | yes | **yes** |
+| `aimdk_msgs/msg/McLocomotionVelocity` | OK | yes | **yes** |
+| `aimdk_msgs/msg/ModuleInfo` | FAIL | no | **no** |
+| `aimdk_msgs/msg/McBodyPose` | FAIL | no | **no** |
+
+`ros2 interface show <type>` predicts recordability exactly, and is the cheap
+preflight check — it runs locally with no DDS discovery.
+
 ### The nav/no_nav profile switch
 
 There are three manifests in `entry/cfg/`:
@@ -530,6 +554,69 @@ back there are two routes:
 ---
 
 # Recording bags
+
+## The easy way: `./record_walk.sh`
+
+Run it **on your PC**. It starts the recorder on soc1, waits while you walk the
+robot, stops cleanly, verifies the bag, and copies it here.
+
+```bash
+./record_walk.sh                      # start, walk, press ENTER to stop
+./record_walk.sh -d 120               # record exactly 2 minutes
+./record_walk.sh -n straight_line_01  # name it
+./record_walk.sh -k                   # keep the bag on the robot too
+./record_walk.sh -V                   # also pull the vendor drp .mcap segments
+./record_walk.sh -h                   # all options
+```
+
+**Typical session:**
+
+```
+$ ./record_walk.sh -n walk_01
+==> Preflight
+  ok  ssh to soc1
+  ok  hal_sensor running
+  ok  point cloud publisher present
+  ok  disk: 383000 MB free (need ~5120 MB)
+==> Validating topics
+  ok  10 topics will be recorded
+WARNING: dropped: /aima/mc/body_pose (type aimdk_msgs/msg/McBodyPose not loadable)
+==> Starting recorder on soc1
+  ok  recorder pid 14812, subscribed to 10/10 topics
+
+  RECORDING — walk the robot now.
+  Motors are torque-enabled; keep clear of the legs.
+  Press ENTER when the walk is finished...
+```
+
+then, after you press ENTER, it prints a per-topic count/rate table, refuses to
+continue if **zero** point clouds were captured, and copies the bag to `data/bags/`.
+
+**What it records** (10 topics, all verified working):
+
+| Topic | Type | Rate |
+|---|---|---|
+| `lidar_chest_front/lidar_pointcloud` | `sensor_msgs/PointCloud2` | 10 Hz |
+| `lidar_chest_front/imu` | `sensor_msgs/Imu` | 200 Hz |
+| `imu/torso/state`, `imu/chest/state` | `sensor_msgs/Imu` | ~497 Hz |
+| `mc/leg_odometry` | `nav_msgs/Odometry` | 168 Hz |
+| `joint/leg/state`, `joint/waist/state` | `aimdk_msgs/JointStateArray` | ~497 Hz |
+| `mc/locomotion/velocity` | `aimdk_msgs/McLocomotionVelocity` | 48 Hz |
+| `/tf`, `/tf_static` | `tf2_msgs/TFMessage` | 46 Hz / latched |
+
+Safety checks it performs, each because of a real failure we hit:
+
+- aborts if `hal_sensor` is down or the cloud has no publisher (retries 3×);
+- aborts if disk is short;
+- **validates every topic's type before recording** — see [Lesson 9](#lesson-9-one-unloadable-type-poisons-the-whole-recording);
+- **aborts if zero point clouds landed** — the QoS trap in [Lesson 2](#lesson-2-qos-best_effort-vs-reliable);
+- verifies byte-for-byte size after copying before deleting from the robot;
+- stops the remote recorder even if you Ctrl-C the script.
+
+Note `-d N` records slightly longer than N: there is a ~6 s settle before the
+countdown plus drain time at the end. Harmless pre-roll.
+
+## Doing it by hand
 
 Our workspace on soc1 is **`/home/run/slam_ws/`** (`/home/agi` is not writable by
 `run`; `/agibot/` is vendor-managed and OTA-updated — keep out of both).
@@ -831,6 +918,67 @@ habit into a fatal error, and output redirection hid the evidence. When a script
 early with no output, re-run the first few lines without redirection before
 theorising.
 
+## Lesson 9: one unloadable type poisons the whole recording
+
+The most expensive bug in the recording script, and the least obvious.
+
+**Symptom.** A test recording produced 9 topics. `/tf`, `/tf_static` and
+`/aima/mc/body_pose` were simply **absent** from the bag — no error at the top
+level, no non-zero exit, just missing data.
+
+**What we expected.** We had already tested this: asking rosbag2 to record a topic
+whose *package* is not on the ament path produces a polite warning and the topic is
+skipped —
+
+```
+[WARN] Topic '/aima/hal/joint/leg/state' has unknown type 'aimdk_msgs/msg/JointStateArray'.
+       Only topics with known type are supported. Reason: package 'aimdk_msgs' not found
+```
+
+so we assumed listing extra topics was harmless.
+
+**What actually happens** when the package *is* found but one message type's
+typesupport library is missing:
+
+```
+[ERROR] [rosbag2_recorder]: Failure in topics discovery.
+Error: Something went wrong loading the typesupport library for message type
+       aimdk_msgs/ModuleInfo. Library could not be found.
+```
+
+This is **not** a skip. It aborts the discovery loop and retries forever, so every
+topic that had not yet been subscribed is never subscribed. One bad topic
+(`lidar_status`, type `ModuleInfo`) silently cost us `/tf` — a topic with a
+perfectly ordinary `tf2_msgs` type that had recorded fine the day before.
+
+**The fix.** Validate every topic's type *before* recording and drop the bad ones.
+`ros2 interface show <type>` predicts it exactly and needs no DDS discovery. The
+script now does this and refuses to start if a *required* topic fails.
+
+**Transferable:** we generalised from one observed failure mode ("unknown package →
+graceful skip") to a different one ("unloadable type → fatal"). Two superficially
+similar errors, opposite consequences. The damage was invisible because the victims
+were unrelated topics.
+
+## Lesson 10: every `ros2` call does its own DDS discovery
+
+**Symptom.** A preflight check that had worked moments earlier started failing with
+"no publisher on lidar_pointcloud". Running the exact same command by hand printed
+`Publisher count: 1`. Re-running the extraction immediately afterwards returned
+nothing at all.
+
+**Cause.** It was not a parsing bug and not stderr-vs-stdout — we checked both. Each
+`ros2 topic list` / `ros2 topic info` invocation spins up its own DDS participant and
+performs a fresh discovery pass. Several in quick succession contend, and one can
+simply come back empty. Our script was doing three separate passes for disk, publisher
+and type checks, which made an occasional failure near-certain.
+
+**The fix.** One remote call, one `ros2 topic list -t` discovery pass, reuse its
+output for every type check, and retry the probes up to 3×.
+
+> On this robot, treat each `ros2` CLI invocation as expensive and unreliable.
+> Batch them.
+
 ---
 
 # Open questions
@@ -839,8 +987,9 @@ theorising.
   `soc0_task_manager` expects, or it will not receive our poses (Lesson 2, in reverse).
   Not yet inspected.
 - **Our own bag recorded while walking.** The vendor's recorder gave us walking IMU
-  (characterised above), but not `PointCloud2`, `leg_odometry` or `/tf`. A 2-minute
-  walk with our recorder running closes this — the recipe is proven and ready.
+  (characterised above), but not `PointCloud2`, `leg_odometry` or `/tf`.
+  **`./record_walk.sh` is written and tested end-to-end against a stationary robot**
+  (10/10 topics, 235 clouds in 23 s). It needs one run while walking.
 - **E1R accelerometer full-scale range.** Walking peaks hit 3.02 g. If configured at
   ±4 g, a faster gait or stumble clips. Readable from DIFOP or the LiDAR's config.
 - **HAL rosbag replay (`data_source: 1`)** — the route from vendor `lidar_raw_data`
@@ -866,6 +1015,7 @@ theorising.
 | Does leg odometry need walking? | **No** — ~167 Hz while idle | bag message counts |
 | Disk space for bags | 384 GB free; **~500 MB/min** | `df` + bag size |
 | Where can we write on soc1? | `/home/run` (**not** `/home/agi`) | writability test |
+| Can we record vendor `aimdk_msgs` topics? | **Partly** — only the 57 types in the prebuilt tree | type table above |
 | How violent is walking for the IMU? | **sd ×600, 0.26–3.02 g, no saturation** | [measured](#walking-dynamics-measured-2026-10-06) |
 | Is walking data recorded automatically? | **Partly** — raw LiDAR + all IMUs yes; `leg_odometry`, `/tf`, `PointCloud2` no | `drp` configs |
 | What is `lidar_raw_data`? | Raw MSOP/DIFOP byte arrays | `LidarRawData.msg` |
