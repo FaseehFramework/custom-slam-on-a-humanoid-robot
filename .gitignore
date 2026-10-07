@@ -1,0 +1,4 @@
+# Recorded bags are large (~500 MB/min); keep them out of git.
+data/bags/
+*.db3
+*.mcap
