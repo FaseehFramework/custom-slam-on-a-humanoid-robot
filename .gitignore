@@ -2,3 +2,8 @@
 data/bags/
 *.db3
 *.mcap
+results/
+slam_ws/build/
+slam_ws/install/
+slam_ws/log/
+slam_ws/src/point_lio_ros2/
