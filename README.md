@@ -8,10 +8,9 @@ This document is the result of a read-only reconnaissance of a live robot. It is
 split into **What we know** (the system as it actually is) and **What we learnt**
 (the traps we fell into getting there — read this one, it will save you hours).
 
-Status: recon complete; static bag recorded by us, walking IMU data obtained from the
-vendor's rolling recorder and characterised. No vendor files modified, nothing started
-or stopped. Next step: our own bag recorded while walking (for `PointCloud2`,
-`leg_odometry` and `/tf`, which the vendor does not record).
+Status: **recon complete, walking dataset captured and verified.** `walk_20261007_102515`
+holds 2:10 of walking with all 10 topics, zero dropped scans and a loop closure. No vendor
+files modified, nothing started or stopped. Next step: run Point-LIO against it.
 
 ---
 
@@ -468,6 +467,50 @@ parser_e1r.cpp:360  IMU TF Static Transform: t(-0.011, 0.004, 0.016),
 
 That quaternion is ≈ the same axis permutation. Two independent sources agree.
 
+### The static frame tree (from `/tf_static`)
+
+```
+base_link          -> pelvis                    identity
+pelvis             -> imu_in_pelvis_link        (+0.0239, -0.0002, +0.0417)
+torso_link         -> imu_in_torso_link         (-0.0249, +0.0020, +0.1059)
+torso_link         -> lidar_chest_front         (+0.1026, +0.0000, +0.1816)
+lidar_chest_front  -> lidar_imu_chest_front     (-0.0113, +0.0043, +0.0157)
+head_pitch_link    -> imu_in_head_link          (+0.0260, -0.0001, +0.0176)
+head_pitch_link    -> rgb_head_center           (+0.0684, -0.0002, +0.0500)
+head_pitch_link    -> rgb_head_rear             (-0.0834, +0.0003, +0.0000)
+head_pitch_link    -> rgbd_head_front           (+0.0576, -0.0112, -0.0484)
+head_pitch_link    -> stereo_head_front         (+0.0680, +0.0298, +0.0500)
+stereo_head_front  -> stereo_head_front_right   (-0.0594, +0.0013, -0.0010)
+stereo_head_front  -> stereo_imu_head_front     identity
+```
+
+Note `pelvis` ↔ `torso_link` is **not** static — it is driven by the waist joint and
+arrives on dynamic `/tf` at 48 Hz. Record `/tf` as well as `/tf_static`.
+
+**Third independent confirmation of the LiDAR→IMU extrinsic.** Three sources, three
+conventions, same transform:
+
+| Source | Value |
+|---|---|
+| `/tf_static` | `(-0.0113, +0.0043, +0.0157)` |
+| HAL log (read from device DIFOP) | `(-0.011, 0.004, 0.016)` |
+| `paramsE1R.yaml` `extrinsic_T` | `(0.00427, -0.01575, -0.01121)` — same magnitudes, permuted axes |
+
+One discrepancy worth noting: `/tf_static` puts `torso_link -> lidar_chest_front` at
+x = **0.1026**, while `paramsE1R.yaml`'s `Tol` has x = **0.094027** (z matches exactly
+at 0.1816). An 8.6 mm difference — most likely because `Tol` is odom→lidar rather than
+torso→lidar, but do not assume the two frames are interchangeable.
+
+### `leg_odometry` is already in the LiDAR IMU frame
+
+```
+header.frame_id = "leg_odom"   child_frame_id = "lidar_imu_chest_front"
+```
+
+The vendor already transforms leg odometry into the LiDAR IMU frame, so it can be fed
+to a LIO backend as a DR prior **without applying any extrinsic**. Convenient, and easy
+to get wrong if you assume it is at `base_link`.
+
 Other assets:
 - URDF: `/agibot/data/info/etc/body/basic/urdf/model.urdf_1`
 - VPR model: `nav/config/slam/orin_vpr_fp16.engine`
@@ -492,6 +535,70 @@ Your laptop on WiFi (`192.168.4.x`) **cannot join this DDS graph**. So:
 - record bags on soc1 and `scp` them off for offline algorithm work.
 
 (A route to `10.0.1.0/24` via soc1 could change this later. Not needed yet.)
+
+---
+
+# Datasets
+
+Bags live in `data/bags/` (gitignored). Analyse any of them with
+`tools/analyze_bag.py <bag>` — continuity, IMU dynamics, trajectory, frames, sync.
+
+## `walk_20261007_102515` — the primary dataset
+
+2:10 of walking, 1.2 GiB, 321,371 messages, all 10 topics. **Verified good.**
+
+| Check | Result |
+|---|---|
+| Point clouds | 1297 @ **10.00 Hz**, dt sd **0.23 ms**, **0 dropped scans** |
+| Cloud width | 24547–25928 (mean 25416) |
+| Per-point ts span | 94.68 ms per 100 ms scan — consistent with ~5 ms inter-scan dead time |
+| LiDAR IMU | 25932 @ 199.9 Hz |
+| Body IMUs | 64842 / 64851 @ 500.0 Hz |
+| Leg odometry | 22040 @ 169.9 Hz |
+| `/tf` | 6245 @ 48.2 Hz; `/tf_static` 3 latched |
+| Clock alignment | cloud/IMU/odom all start within **52 ms** — one PTP timebase, confirmed in data |
+
+**Trajectory:** ~**19.2 m travelled** (speed-integrated) in a **5.43 × 5.45 m** area,
+moving 83.2 % of samples, mean 0.148 m/s, max 0.775 m/s. It wanders out and returns:
+0.74 m from start at t=60 s and **0.15 m at t=119.7 s** — a real **loop-closure
+opportunity**, revisited twice.
+
+**Walking dynamics** (matches the independent vendor-bag measurement closely, so the
+numbers are reproducible):
+
+| | LiDAR IMU | Torso IMU |
+|---|---|---|
+| `\|a\|` mean / sd | 9.936 / 2.370 | 9.973 / 2.465 |
+| `\|a\|` min / max | 2.957 / 27.916 | 2.751 / 29.477 |
+| `\|w\|` max | 3.291 rad/s | 3.756 rad/s |
+| Δ`\|a\|` p99 / max | 2.983 / 9.321 | 1.944 / 5.843 |
+
+The LiDAR IMU sees **sharper transients** than the torso IMU (Δ`|a|` p99 2.983 vs
+1.944) despite similar overall variance — it is mounted closer to the impact path.
+Since that is the IMU your LIO uses, treat it as the harsher of the two.
+
+### Caution: `leg_odometry` path length is not distance travelled
+
+Naively summing position deltas gives **64.47 m**, against 19.2 m of actual travel and
+3.08 m net. That is **not** noise — downsampling from 170 Hz to 2 Hz only reduces it to
+53.32 m, so it is real low-frequency motion. The cause is gait: the odometry is
+expressed at the chest IMU, which physically oscillates **17.7 cm peak-to-peak
+vertically at 1.79 Hz** (the step frequency).
+
+Use the twist (`speed × time`) for distance travelled; use the pose as a DR prior,
+which is what a LIO backend wants anyway.
+
+## `static_20261006_095735`
+
+21.5 s, 179 MiB, stationary baseline. Useful as the noise floor: `|a|` sd 0.004 m/s²
+against 2.4 while walking.
+
+## `vendor_walk_20261006/`
+
+Two vendor `drp` MCAP segments (516 MiB) covering a 10:17–10:19 walk, pulled before
+the rolling buffer discarded them. Contains the 200 Hz LiDAR IMU, but the LiDAR only
+as undecoded `LidarRawData` packets, and no `leg_odometry`/`/tf`. Superseded by
+`walk_20261007_102515`; kept as an independent cross-check.
 
 ---
 
@@ -986,10 +1093,9 @@ output for every type check, and retry the probes up to 3×.
 - **QoS of the `/slam/*` topics** we need to publish — must match what
   `soc0_task_manager` expects, or it will not receive our poses (Lesson 2, in reverse).
   Not yet inspected.
-- **Our own bag recorded while walking.** The vendor's recorder gave us walking IMU
-  (characterised above), but not `PointCloud2`, `leg_odometry` or `/tf`.
-  **`./record_walk.sh` is written and tested end-to-end against a stationary robot**
-  (10/10 topics, 235 clouds in 23 s). It needs one run while walking.
+- **A larger-area dataset.** `walk_20261007_102515` covers only 5.4 × 5.4 m. Fine for
+  a first PoC and it has a loop closure, but too small to characterise drift over
+  distance. A longer corridor traverse would complement it.
 - **E1R accelerometer full-scale range.** Walking peaks hit 3.02 g. If configured at
   ±4 g, a faster gait or stumble clips. Readable from DIFOP or the LiDAR's config.
 - **HAL rosbag replay (`data_source: 1`)** — the route from vendor `lidar_raw_data`
@@ -999,8 +1105,9 @@ output for every type check, and retry the probes up to 3×.
 - **Vendor cloud coupling.** `emqx.agibot.com`, the MQTT plugin wired into the SLAM
   module itself, `soc0_cloud_proxy`, `cobridge`. Extent of any backend dependency is
   not yet mapped.
-- **`/tf` tree contents** — 3 latched `/tf_static` messages were captured but the
-  frame tree has not been examined.
+- **Dynamic `/tf` chain.** `/tf_static` is now known (below), but the articulated
+  links (`pelvis` ↔ `torso_link`, driven by the waist joint) come through dynamic
+  `/tf` at 48 Hz and have not been walked through.
 - **Kinematic odometry from joint states.** soc0 records all leg joint states at
   9 GB retention. With the URDF, leg odometry could be computed independently of
   `/aima/mc/leg_odometry` — useful both as a cross-check and as a fallback.
