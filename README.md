@@ -8,9 +8,9 @@ This document is the result of a read-only reconnaissance of a live robot. It is
 split into **What we know** (the system as it actually is) and **What we learnt**
 (the traps we fell into getting there — read this one, it will save you hours).
 
-Status: **recon complete, walking dataset captured and verified.** `walk_20261007_102515`
-holds 2:10 of walking with all 10 topics, zero dropped scans and a loop closure. No vendor
-files modified, nothing started or stopped. Next step: run Point-LIO against it.
+Status: **Point-LIO running on real X2 Ultra data.** ~0.097 m drift over 120 s of walking
+(~0.5 %), 1 mm vertical drift. Recon complete, walking dataset captured and verified. No
+vendor files modified, nothing started or stopped on the robot.
 
 ---
 
@@ -761,7 +761,9 @@ with no error message. `/home/run/slam_ws/qos_override.yaml`:
 
 A BEST_EFFORT **reader** matches both BEST_EFFORT and RELIABLE writers, so it is the
 safe default for everything except `/tf_static`, where `transient_local` is what
-actually delivers the already-latched transforms.
+actually delivers the already-latched transforms. (Only `leg_odometry` is actually
+published BEST_EFFORT — see the correction in Lesson 2 — but a permissive reader costs
+nothing and protects against the vendor changing a QoS profile.)
 
 Confirm the override took effect — the recorder logs one line per topic:
 
@@ -830,6 +832,98 @@ the vendor's own choice (Faster-LIO) is open source, so their tuned parameters i
 | **LIO-SAM** | **Not compatible as-is.** Requires a 9-axis IMU with valid orientation; ours is 6-axis with `orientation = (0,0,0,1)` and zero covariance. The vendor's dead `agi_sam:` block specifies `imuType: 1 #9-axis` and they chose `fasterlio` instead — same constraint. |
 
 Whatever is chosen needs the `timestamp` -> `time` adapter described above.
+
+---
+
+# Running Point-LIO
+
+Working end-to-end on `walk_20261007_102515`. Everything lives in `slam_ws/`.
+
+## Build
+
+```bash
+cd slam_ws/src
+git clone --depth 1 https://github.com/dfloreaa/point_lio_ros2.git
+cd .. && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+**One patch is required** — upstream's `CMakeLists.txt` does
+`find_package(pcl_ros REQUIRED)` but **nothing in `src/` includes `pcl_ros`**. Rather
+than `apt install ros-humble-pcl-ros`, we comment out the three references:
+
+```bash
+patch -p0 < patches/point_lio_ros2-drop-pcl_ros.patch
+```
+
+No other system packages are needed (`libpcl-dev`, `pcl_conversions`, `libeigen3-dev`
+are already present on this machine).
+
+## Run
+
+```bash
+./tools/run_point_lio.sh data/bags/walk_20261007_102515            # headless
+./tools/run_point_lio.sh data/bags/walk_20261007_102515 --rviz     # with RViz
+./tools/eval_trajectory.py results/<name>_pointlio data/bags/<name>
+```
+
+Output lands in `results/<bagname>_pointlio/` as a bag of `/aft_mapped_to_init`
+(`nav_msgs/Odometry`) and `/path`.
+
+## `x2_cloud_adapter` — why it is needed
+
+Point-LIO's Velodyne handler expects `velodyne_ros::Point`, which is the **same 32-byte
+stride** as the vendor cloud but with **`time` and `ring` swapped**:
+
+```
+vendor  : x,y,z(f32) intensity(f32@16) ring(u16@20)  timestamp(f64@24)
+velodyne: x,y,z(f32) intensity(f32@16) time(f32@20)  ring(u16@24)
+```
+
+and the per-point value must become **float32 seconds** rather than float64
+nanoseconds. `slam_ws/src/x2_cloud_adapter` does exactly that and nothing else. It
+resolves field offsets **by name at runtime**, so a vendor firmware change produces a
+clear error instead of silently garbled geometry.
+
+## Config choices that are not the stock defaults
+
+`slam_ws/src/x2_cloud_adapter/config/x2_ultra.yaml`. Four of these matter a great deal:
+
+| Parameter | Stock | Ours | Why |
+|---|---|---|---|
+| `satu_acc` | 30.0 | **40.0** | Walking peaks reach **29.5 m/s²**. With `check_satu: true`, the stock value makes Point-LIO discard real footfall impacts as saturated IMU readings. We verified the IMU is not actually saturating (mean \|a\| stays at g). |
+| `scan_line` | 32 | **96** | The E1R reports `ring` 0–95. Too small risks an out-of-bounds write into `is_first[layer]` on the no-offset-time path. |
+| `imu_time_inte` | 0.01 | **0.005** | IMU is 200 Hz, not 100 Hz. |
+| `blind` | 2.0 | **0.5** | Observed point range is 1.05–12.8 m indoors; 2.0 discards much of a small room. |
+| `timestamp_unit` | 2 (µs) | **0 (s)** | The adapter emits seconds. |
+
+Noise terms (`b_acc_cov`, `b_gyr_cov`, `gyr_cov_input`, `acc_cov_input`, `plane_thr`)
+and the extrinsics are taken from the vendor's own `paramsE1R.yaml`. The vendor runs
+Faster-LIO, which shares FAST-LIO's `extrinsic_T`/`extrinsic_R` convention
+(LiDAR→IMU), so their numbers transfer directly.
+
+## Results on `walk_20261007_102515`
+
+| Metric | Point-LIO | leg odometry (reference) |
+|---|---|---|
+| Poses | 1146 @ 8.9 Hz | — |
+| Net displacement | 2.732 m | 3.084 m |
+| Distance from start at t=119.7 s | **0.251 m** | 0.153 m |
+| z at end (flat floor) | **−0.001 m** | — |
+
+The robot physically returned to within 0.153 m of its start, so **position drift is
+~0.097 m over 120 s and ~19 m travelled — about 0.5 %.** For a legged platform with
+3 g footfall transients that is a good result. The 1 mm vertical drift shows gravity
+alignment is working.
+
+**Do not compare the x/y extents of the two trajectories directly.** Point-LIO's world
+frame is gravity-aligned with an arbitrary yaw at initialisation, while `leg_odom` has
+its own yaw convention, so the two are rotated relative to each other. The
+return-to-start metric above is rotation-invariant, which is why it is the one quoted.
+A proper comparison needs Umeyama alignment — not yet done.
+
+**Caveat:** this run played the bag at `--rate 2.0` and produced 1146 poses from 1297
+clouds. Some of the shortfall is initialisation, but some is likely the laptop not
+keeping up at 2×. Re-run at `--rate 1.0` before treating the pose count as meaningful.
 
 ---
 
@@ -903,11 +997,30 @@ with `ros2 topic list`. Three to one should have ended the argument sooner.
 **Symptom.** With the daemon problem fixed and the topics visible,
 `ros2 topic hz <pointcloud>` printed **nothing at all**. Not a low rate — no output.
 
-**The trap.** Sensor topics here are published **BEST_EFFORT**. `ros2 topic hz`,
-`ros2 topic echo` and `ros2 bag record` all default to **RELIABLE**. A RELIABLE
-subscriber and a BEST_EFFORT publisher are **incompatible** under DDS: they never
-match, so your subscriber receives exactly zero messages and reports no error. It
-looks identical to a dead sensor.
+**The trap.** A RELIABLE subscriber and a BEST_EFFORT publisher are **incompatible**
+under DDS: they never match, so the subscriber receives exactly zero messages and
+reports no error. It looks identical to a dead sensor. `ros2 topic hz`, `ros2 topic
+echo` and `ros2 bag record` all default to **RELIABLE**.
+
+> **Correction.** An earlier version of this document said "every sensor topic here is
+> BEST_EFFORT". **That is wrong.** Verified against the live robot with
+> `ros2 topic info -v` and against the recorded `offered_qos_profiles`:
+>
+> | Topic | Reliability | Durability |
+> |---|---|---|
+> | `lidar_chest_front/lidar_pointcloud` | **RELIABLE** | TRANSIENT_LOCAL |
+> | `lidar_chest_front/imu` | **RELIABLE** | TRANSIENT_LOCAL |
+> | `/tf`, `/tf_static` | RELIABLE | VOLATILE / TRANSIENT_LOCAL |
+> | **`/aima/mc/leg_odometry`** | **BEST_EFFORT** | TRANSIENT_LOCAL |
+>
+> So `hz` failing on the *point cloud* was **Lesson 10** (transient discovery failure),
+> not QoS — we mis-attributed it. The QoS override is still genuinely required, because
+> `leg_odometry` really is BEST_EFFORT and a default RELIABLE recorder silently drops
+> it. Right conclusion, wrong reason; the distinction matters when diagnosing the next
+> failure. It also matters in reverse: Point-LIO subscribes to IMU **RELIABLE**
+> (`create_subscription<Imu>(imu_topic, 200000, ...)`) while its cloud subscriber uses
+> `SensorDataQoS` (BEST_EFFORT). Because the vendor IMU is RELIABLE, that happens to
+> work — had it been BEST_EFFORT, Point-LIO would have received no IMU at all.
 
 **The fix — add explicit QoS:**
 
