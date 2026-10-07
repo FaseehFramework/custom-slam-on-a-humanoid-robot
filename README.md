@@ -8,8 +8,10 @@ This document is the result of a read-only reconnaissance of a live robot. It is
 split into **What we know** (the system as it actually is) and **What we learnt**
 (the traps we fell into getting there — read this one, it will save you hours).
 
-Status: recon complete. No vendor files modified. Nothing started or stopped.
-Next step: record a bag.
+Status: recon complete; static bag recorded by us, walking IMU data obtained from the
+vendor's rolling recorder and characterised. No vendor files modified, nothing started
+or stopped. Next step: our own bag recorded while walking (for `PointCloud2`,
+`leg_odometry` and `/tf`, which the vendor does not record).
 
 ---
 
@@ -123,7 +125,7 @@ fragments.
 
 | Topic | Rate | Source | Notes |
 |---|---|---|---|
-| `/aima/hal/sensor/lidar_chest_front/imu` | — | E1R built-in | **what the SLAM uses** |
+| `/aima/hal/sensor/lidar_chest_front/imu` | **200 Hz** | E1R built-in | **what the SLAM uses** |
 | `/aima/hal/imu/torso/state` | ~501 Hz | `soc0_hal_imu` | body IMU |
 | `/aima/hal/imu/chest/state` | ~515 Hz | `soc0_hal_imu` | body IMU |
 | `/aima/hal/sensor/stereo_head_front/imu` | 200 Hz | stereo head | |
@@ -147,6 +149,38 @@ Two things that matter when configuring a LIO frontend:
   wrong fails silently and looks like divergence.
 - **6-axis, no orientation.** Your filter estimates attitude itself.
 - Gravity splits between x and z (tilt ≈ 21.5°) — the chest LiDAR is angled downward.
+
+### Walking dynamics (measured, 2026-10-06)
+
+Measured from the LiDAR IMU over a ~2 minute walk, against our static baseline.
+**This is the single most important measurement for algorithm selection.**
+
+| | **Walking** | **Static** |
+|---|---|---|
+| `\|accel\|` mean | 9.933 m/s² | 9.840 m/s² |
+| `\|accel\|` **sd** | **2.424** | **0.004** |
+| `\|accel\|` min / max | **2.581 / 29.597** | 9.825 / 9.854 |
+| `\|gyro\|` max | **3.080 rad/s** (176 °/s) | 0.014 |
+| Δ`\|accel\|` per sample, max | **9.542 m/s²** | 0.010 |
+| samples >5 m/s² off gravity | **5.37 %** | 0.00 % |
+
+Interpretation:
+
+- **Variance rises ~600×.** The static IMU is near-noiseless (sd 0.004 m/s²), so
+  essentially all of the walking variance is real motion, not sensor noise.
+- **The range spans 0.26 g to 3.02 g.** The 2.58 m/s² minimum is the chest going
+  near-ballistic between footfalls; the 29.6 m/s² peaks are the impacts.
+- **Mean gravity is preserved** (9.93 vs 9.84) ⇒ the accelerometer is **not
+  saturating**, so the data is trustworthy rather than clipped.
+- 200 Hz IMU / 10 Hz LiDAR = **20 IMU samples per scan**, with up to 9.5 m/s² change
+  between consecutive samples. Intra-scan motion is large, so **deskewing is
+  mandatory**, not an optimisation.
+
+**Caution:** peaks at 3.02 g are sampled cleanly now, but if the E1R accelerometer is
+configured at ±4 g, a faster gait or a stumble would clip. Confirm the configured
+range before trusting data from more dynamic runs.
+
+Reproduce with `/home/run/slam_ws/imu_walk.py`.
 
 ### Cameras
 
@@ -318,9 +352,16 @@ Subscription count: 1`). The slot is vacant and well-defined.
 | `/tf` | `tf2_msgs/msg/TFMessage` |
 | `/heartbeat/loc_state` | liveness (MQTT + ROS 2) |
 
-`/aima/mc/leg_odometry` has a live publisher (`mc_ros2_node`) but produces nothing
-while the robot is idle — leg odometry only flows once the controller is actually
-walking. This has not yet been observed in motion.
+`/aima/mc/leg_odometry` publishes at **~167 Hz even while the robot is idle and
+damped** — it does not require the robot to be walking.
+
+> **This corrects an earlier conclusion in this document's history.** We first
+> recorded that leg odometry "only flows once walking", because `ros2 topic hz`
+> showed nothing. That silence was our own tooling — stale daemon plus a RELIABLE
+> subscriber against a BEST_EFFORT publisher (Lessons 1 and 2) — not robot state.
+> Recording the topic into a bag with correct QoS produced 3589 messages in 21.5 s.
+> When a measurement disagrees with your mental model of the robot, suspect the
+> measurement first; here the same root cause produced two wrong conclusions.
 
 ### Point cloud format
 
@@ -336,7 +377,35 @@ point_step 32   width ~24583   height 1   is_dense true   frame_id lidar_chest_f
 
 This is the Velodyne-style layout FAST-LIO / Faster-LIO consume natively, and it
 **includes a per-point timestamp**, so motion deskewing is available. ~786 KB per
-message.
+message, published at **10.0 Hz**.
+
+### Per-point timestamp semantics (measured, not assumed)
+
+> `timestamp` is **float64 nanoseconds, relative to scan start**.
+> `header.stamp` is the **scan start time**.
+
+Measured from a recorded bag:
+
+```
+cloud 0:  header 1791266255.515525   pt ts [   498000 .. 95176000 ]
+cloud 1:  header 1791266255.615349   dt from prev header = 99.824 ms
+cloud 2:  header 1791266255.715364   dt from prev header = 100.015 ms
+```
+
+The point span is ~94.8e6, which is 94.8 ms in nanoseconds — one 10 Hz scan period.
+This confirms `relative_cloud_pt_time: true` in `paramsE1R.yaml`.
+
+**Integration consequence:** FAST-LIO's Velodyne handler expects a `time` field in
+**seconds** relative to scan start. The conversion is one multiply:
+
+```
+time_seconds = timestamp * 1e-9
+```
+
+No absolute-epoch conversion and no sign flip. The field is also *named*
+`timestamp` (float64) where FAST-LIO expects `time` (float32) and Ouster-style
+drivers expect `t` (uint32), so a small republisher or a patched preprocess is
+needed — but the maths is trivial.
 
 ## Factory calibration — do not re-derive this
 
@@ -399,6 +468,174 @@ Your laptop on WiFi (`192.168.4.x`) **cannot join this DDS graph**. So:
 - record bags on soc1 and `scp` them off for offline algorithm work.
 
 (A route to `10.0.1.0/24` via soc1 could change this later. Not needed yet.)
+
+---
+
+# Vendor continuous recording (`drp`)
+
+The `drp` app runs in the **active `no_nav` profile** and continuously records
+rolling MCAP bags to `/agibot/data/bag/`. This is free data for every run you do —
+but it does **not** cover everything, so read the gaps before relying on it.
+
+| Stream | Panel | Retention | Key contents |
+|---|---|---|---|
+| `hal_sensor` | soc1 | **4 GB** (~27 min) | `lidar_raw_data`, `lidar_chest_front/imu` @200 Hz, `touch_head`, 2× `camera_info` |
+| `rt_control_link` | soc0 | **9 GB** | all joint `state`+`command` (leg/arm/waist/head/hand), **`imu/torso`**, **`imu/chest`**, `mc/rl/debug`, `mc/common/state` |
+| `external_control_link` | soc0 | 1 GB | `mc/body_pose`, `mc/locomotion/velocity`, `teleop_bridge/vr_data` |
+| `software` | all | 4 GB | diagnostics / process info only |
+
+Config: `/agibot/software/drp/bin/cfg/lx2501_3/<soc>/*.yaml`
+(`lx2501_3` matches `param/info/project_id`).
+
+### What the vendor does NOT record
+
+- **`/aima/mc/leg_odometry`** — recorded nowhere.
+- **`/tf` and `/tf_static`** — recorded nowhere.
+- **`PointCloud2`** — see below; only raw packets are stored.
+
+Those three gaps are exactly why we still need our own recorder.
+
+### Retention is a rolling buffer — copy promptly
+
+`hal_sensor` keeps ~4 GB in 256 MB segments of ~108 s each: roughly **27 minutes of
+history**. Data older than that is gone. After any run worth keeping, copy the
+covering segments off immediately.
+
+```bash
+ls -la /agibot/data/bag/hal_sensor/aimrtbag_*/        # find segments by timestamp
+scp soc1:/agibot/data/bag/hal_sensor/<dir>/<seg>.mcap data/bags/
+ros2 bag info -s mcap <file>.mcap                     # note: -s mcap
+```
+
+### `lidar_raw_data` is raw packets, not points
+
+```
+# aimdk_msgs/msg/LidarRawData
+MessageHeader header
+uint8[] msop_data     # raw MSOP bytes, unparsed
+uint8[] difop_data    # raw DIFOP bytes
+```
+
+~232 KB/message at 10 Hz, versus 786 KB for the decoded `PointCloud2`. To get points
+back there are two routes:
+
+1. **Replay through the vendor HAL.** `hal_sensor_module_config_orin.yaml` has
+   `data_source: 1` (rosbag) alongside `0` (online) and `2` (pcap). Copy the config
+   to `/home/run/slam_ws/`, point it at the bag, and run
+   `aima-hal_sensor-app-main --cfg_file_path=<our copy>`. Nothing vendor-owned is
+   modified. **Untested so far.**
+2. **Parse MSOP ourselves** — the format is known (1200-byte payloads, magic
+   `55 aa 5a a5`), but this is strictly more work than route 1.
+
+---
+
+# Recording bags
+
+Our workspace on soc1 is **`/home/run/slam_ws/`** (`/home/agi` is not writable by
+`run`; `/agibot/` is vendor-managed and OTA-updated — keep out of both).
+
+```
+/home/run/slam_ws/qos_override.yaml   QoS overrides (mandatory, see below)
+/home/run/slam_ws/bags/               recordings
+/home/run/slam_ws/ts_probe.py         per-point timestamp analysis
+```
+
+## The QoS override is not optional
+
+`ros2 bag record` subscribes **RELIABLE** by default. Every sensor topic here is
+**BEST_EFFORT**. Without an override you get a bag containing **zero point clouds**,
+with no error message. `/home/run/slam_ws/qos_override.yaml`:
+
+```yaml
+/aima/hal/sensor/lidar_chest_front/lidar_pointcloud:
+  history: keep_last
+  depth: 200
+  reliability: best_effort
+  durability: volatile
+/aima/hal/sensor/lidar_chest_front/imu:
+  history: keep_last
+  depth: 2000
+  reliability: best_effort
+  durability: volatile
+# ... same shape for the body IMUs, leg_odometry and /tf ...
+/tf_static:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: transient_local      # transient_local to receive the latched messages
+```
+
+A BEST_EFFORT **reader** matches both BEST_EFFORT and RELIABLE writers, so it is the
+safe default for everything except `/tf_static`, where `transient_local` is what
+actually delivers the already-latched transforms.
+
+Confirm the override took effect — the recorder logs one line per topic:
+
+```
+[rosbag2_recorder]: Overriding subscription profile for /aima/hal/...
+```
+
+## Command
+
+```bash
+source /opt/ros/humble/setup.bash          # NOTE: do this with `set +u`, see Lesson 8
+export FASTRTPS_DEFAULT_PROFILES_FILE=/agibot/software/entry/cfg/ros_dds_configuration.xml
+cd /home/run/slam_ws/bags
+
+ros2 bag record -o "static_$(date +%Y%m%d_%H%M%S)" \
+  --qos-profile-overrides-path /home/run/slam_ws/qos_override.yaml \
+  /aima/hal/sensor/lidar_chest_front/lidar_pointcloud \
+  /aima/hal/sensor/lidar_chest_front/imu \
+  /aima/hal/imu/torso/state \
+  /aima/hal/imu/chest/state \
+  /aima/mc/leg_odometry \
+  /tf /tf_static
+```
+
+## Measured rates and cost
+
+From `static_20261006_095735` (21.46 s, 30,440 messages, 179 MiB):
+
+| Topic | Count | Rate |
+|---|---|---|
+| `lidar_chest_front/lidar_pointcloud` | 215 | **10.0 Hz** |
+| `lidar_chest_front/imu` | 4293 | **200.0 Hz** |
+| `/aima/hal/imu/torso/state` | 10672 | 497.2 Hz |
+| `/aima/hal/imu/chest/state` | 10676 | 497.4 Hz |
+| `/aima/mc/leg_odometry` | 3589 | **167.2 Hz** |
+| `/tf` | 992 | 46.2 Hz |
+| `/tf_static` | 3 | latched |
+
+**Storage: ~8.3 MB/s ≈ 500 MB/min ≈ 30 GB/hr.** soc1 has 384 GB free, so roughly
+12 hours of recording capacity — but bags should be copied off and deleted promptly.
+
+Copying off runs at ~10.5 MB/s over WiFi (179 MiB in 17 s), marginally faster than
+the generation rate. Copy after recording; do not try to stream live.
+
+```bash
+scp -r soc1:/home/run/slam_ws/bags/<name> data/bags/
+```
+
+`data/bags/` is gitignored.
+
+---
+
+# Choosing an algorithm
+
+We do not need to write a SLAM frontend from scratch to get a proof of concept. The
+cloud format is the Velodyne-style layout the whole FAST-LIO family consumes, and
+the vendor's own choice (Faster-LIO) is open source, so their tuned parameters in
+`paramsE1R.yaml` map onto a stock build.
+
+| Candidate | Verdict |
+|---|---|
+| **KISS-ICP** | Best first step. ROS 2 native, LiDAR-only, no IMU, no extrinsics, minimal config. Proves the data pipeline end to end. Not the final answer. |
+| **Point-LIO** | **Start here for the real PoC.** Built for exactly this regime: it drops the fixed-scan-period assumption and treats IMU readings as measurements of state rather than propagation inputs, which is what 3 g footfall transients at 200 Hz demand. See [Walking dynamics](#walking-dynamics-measured-2026-10-06) for the evidence. |
+| **FAST-LIO2** | Well-proven baseline; uses the factory extrinsics and kalibr noise params directly. But its propagation assumes the IMU adequately samples motion between scans — strained here at 20 samples/scan with 3 g transients. Worth running as a comparison, not as the first choice. |
+| **Faster-LIO** | What the vendor runs. Use it to reproduce their baseline and compare. |
+| **LIO-SAM** | **Not compatible as-is.** Requires a 9-axis IMU with valid orientation; ours is 6-axis with `orientation = (0,0,0,1)` and zero covariance. The vendor's dead `agi_sam:` block specifies `imuType: 1 #9-axis` and they chose `fasterlio` instead — same constraint. |
+
+Whatever is chosen needs the `timestamp` -> `time` adapter described above.
 
 ---
 
@@ -573,22 +810,65 @@ startup and **nothing had been written to the log in the 13 minutes since**. The
 were transient startup noise, self-recovered. Check whether a log is still *growing*
 before acting on what it says.
 
+## Lesson 8: `set -u` breaks `source /opt/ros/humble/setup.bash`
+
+Our first bag-recording script died immediately after writing its config file, with
+exit code 1 and no error message. Cause: the script opened with `set -u`, and ROS 2's
+`setup.bash` dereferences unbound variables (`AMENT_TRACE_SETUP_FILES`, `COLCON_*`
+and friends). Under `set -u` that is a fatal error, and since we had redirected the
+output, it was silent.
+
+The robot's own `x2_recon.sh` already guarded against this — it sources each ROS
+distro inside `( set +u; source ... )`, a subshell that both relaxes the check and
+prevents the environment leaking between distros. Worth copying that pattern:
+
+```bash
+( set +u; source /opt/ros/humble/setup.bash; ... )
+```
+
+General form of the mistake: a strictness flag turned a third-party script's benign
+habit into a fatal error, and output redirection hid the evidence. When a script dies
+early with no output, re-run the first few lines without redirection before
+theorising.
+
 ---
 
 # Open questions
 
-- **Point cloud rate.** `ros2 topic hz` never reported one even with correct QoS.
-  Needs measuring by timing message counts directly.
-- **`/aima/mc/leg_odometry` in motion.** Advertised, publisher present, silent while
-  idle. Unverified while walking.
 - **QoS of the `/slam/*` topics** we need to publish — must match what
   `soc0_task_manager` expects, or it will not receive our poses (Lesson 2, in reverse).
-- **Disk space on soc1** for bag recording (~0.5–1 GB/min at 786 KB/scan).
+  Not yet inspected.
+- **Our own bag recorded while walking.** The vendor's recorder gave us walking IMU
+  (characterised above), but not `PointCloud2`, `leg_odometry` or `/tf`. A 2-minute
+  walk with our recorder running closes this — the recipe is proven and ready.
+- **E1R accelerometer full-scale range.** Walking peaks hit 3.02 g. If configured at
+  ±4 g, a faster gait or stumble clips. Readable from DIFOP or the LiDAR's config.
+- **HAL rosbag replay (`data_source: 1`)** — the route from vendor `lidar_raw_data`
+  back to `PointCloud2`. Looks designed for this; untested.
 - **`em-server` HTTP API** on `0.0.0.0:50080` — presumably how apps are started and
   stopped cleanly. Undocumented so far.
 - **Vendor cloud coupling.** `emqx.agibot.com`, the MQTT plugin wired into the SLAM
   module itself, `soc0_cloud_proxy`, `cobridge`. Extent of any backend dependency is
   not yet mapped.
+- **`/tf` tree contents** — 3 latched `/tf_static` messages were captured but the
+  frame tree has not been examined.
+- **Kinematic odometry from joint states.** soc0 records all leg joint states at
+  9 GB retention. With the URDF, leg odometry could be computed independently of
+  `/aima/mc/leg_odometry` — useful both as a cross-check and as a fallback.
+
+### Resolved
+
+| Question | Answer | Where |
+|---|---|---|
+| Point cloud rate | **10.0 Hz** | bag message counts |
+| LiDAR IMU rate | **200 Hz** | bag message counts |
+| Per-point timestamp units | **float64 ns, relative to scan start** | [measured](#per-point-timestamp-semantics-measured-not-assumed) |
+| Does leg odometry need walking? | **No** — ~167 Hz while idle | bag message counts |
+| Disk space for bags | 384 GB free; **~500 MB/min** | `df` + bag size |
+| Where can we write on soc1? | `/home/run` (**not** `/home/agi`) | writability test |
+| How violent is walking for the IMU? | **sd ×600, 0.26–3.02 g, no saturation** | [measured](#walking-dynamics-measured-2026-10-06) |
+| Is walking data recorded automatically? | **Partly** — raw LiDAR + all IMUs yes; `leg_odometry`, `/tf`, `PointCloud2` no | `drp` configs |
+| What is `lidar_raw_data`? | Raw MSOP/DIFOP byte arrays | `LidarRawData.msg` |
 
 # Safety notes
 
