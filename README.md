@@ -588,6 +588,33 @@ vertically at 1.79 Hz** (the step frequency).
 Use the twist (`speed × time`) for distance travelled; use the pose as a DR prior,
 which is what a LIO backend wants anyway.
 
+## `office_corridor_02` — the corridor dataset
+
+4 minutes, 2.2 GiB, 590,173 messages, recorded detached over the robot's own AP.
+**Clean capture, but Point-LIO fails on it — see below.**
+
+| Check | Result |
+|---|---|
+| Point clouds | 2383 @ **10.00 Hz**, dt sd **0.21 ms**, **0 dropped** |
+| LiDAR IMU | 47,668 @ 200 Hz |
+| Clock alignment | cloud/IMU/odom within **158 ms** |
+| Extrinsics + frame tree | identical to `walk_20261007_102515` (calibration stable across sessions) |
+
+**Coverage is much better than the first bag:**
+
+| | `walk_20261007_102515` | `office_corridor_02` |
+|---|---|---|
+| XY extent | 5.4 x 5.4 m | **17.6 x 17.5 m** |
+| Max distance from start | 3.9 m | **18.9 m** |
+| Travelled (speed-integrated) | ~19 m | **~31 m** |
+| Returns to start | 0.15 m | 1.84 m @ t=206 s |
+| **Median point range** | 3.40 m | **1.92 m** |
+| Max range seen | 12.8 m | 20.3 m |
+
+The corridor is *narrower* than the room in sensor terms: median range dropped to
+1.92 m (per-scan medians as low as 0.67 m) even though the sensor saw 20.3 m down the
+corridor at times.
+
 ## `static_20261006_095735`
 
 21.5 s, 179 MiB, stationary baseline. Useful as the noise floor: `|a|` sd 0.004 m/s²
@@ -661,6 +688,54 @@ back there are two routes:
 ---
 
 # Recording bags
+
+## Recording out of WiFi range (detached mode)
+
+When the robot walks out of range of the office WiFi, connect the laptop to **the
+robot's own access point** and record detached, so the recording survives the link
+dropping entirely.
+
+### The robot's AP
+
+`hostapd` runs on **soc0**, serving `hotspot0` at `192.168.88.88`, DHCP
+`192.168.88.100–200`. The recorder runs on **soc1**, which is on a different subnet
+(`10.0.1.41`) — and **soc0 has `ip_forward=0`**, so `10.0.1.x` is *not* IP-routable
+from the hotspot.
+
+**ProxyJump works regardless**, because soc0's sshd opens the connection to soc1
+itself rather than routing packets. `~/.ssh/config` has `soc0ap` / `soc1ap` / `soc2ap`
+entries for this. Select them with `X2_HOST`:
+
+```bash
+X2_HOST=soc1ap ./record_walk.sh --list
+```
+
+### The walk
+
+```bash
+# 1. join the robot's AP, then start recording and walk away
+X2_HOST=soc1ap ./record_walk.sh --detach -n office_corridor_01 --max 900
+
+# 2. ... walk the robot. The link may drop; recording continues on the robot. ...
+
+# 3. back in range (AP or office WiFi — either works)
+X2_HOST=soc1ap ./record_walk.sh --list      # is it still running? how big?
+X2_HOST=soc1ap ./record_walk.sh --stop      # stop it
+X2_HOST=soc1ap ./record_walk.sh --fetch     # verify, copy here, delete there
+```
+
+`--fetch` with no name reads `.rec.name` from the robot, so you do not have to
+remember what you called it. It refuses to delete the robot's copy unless the local
+copy matches byte-for-byte, and refuses outright if the bag contains zero point clouds.
+
+### The watchdog
+
+`--detach` arms an auto-stop on the robot (`--max`, default 1800 s). The recorder
+writes **~12 MB/s**, so an unattended run that is never stopped would eventually fill
+the disk. With 383 GB free that is ~9 hours of headroom, but the watchdog means a
+forgotten recording stops by itself rather than filling the disk. Verified: it fires.
+
+Set `--max` a bit longer than you expect to walk; stopping early costs nothing.
 
 ## The easy way: `./record_walk.sh`
 
@@ -842,21 +917,45 @@ Working end-to-end on `walk_20261007_102515`. Everything lives in `slam_ws/`.
 ## Build
 
 ```bash
-cd slam_ws/src
-git clone --depth 1 https://github.com/dfloreaa/point_lio_ros2.git
-cd .. && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+./tools/bootstrap_slam_ws.sh            # clone if needed, patch, build
+./tools/bootstrap_slam_ws.sh --fresh    # also wipe build/ install/ log/ first
 ```
 
-**One patch is required** — upstream's `CMakeLists.txt` does
-`find_package(pcl_ros REQUIRED)` but **nothing in `src/` includes `pcl_ros`**. Rather
-than `apt install ros-humble-pcl-ros`, we comment out the three references:
+That is the whole build. It clones upstream, applies our patch, builds, and verifies
+both executables exist. Takes ~40 s from nothing.
 
-```bash
-patch -p0 < patches/point_lio_ros2-drop-pcl_ros.patch
-```
+**Why a script and not instructions:** `slam_ws/src/point_lio_ros2/` is a third-party
+clone and is **gitignored**, as are `build/`, `install/` and `log/`. A `git clean -xdf`
+therefore deletes all of them. Nothing in there is authored by us, so it should be
+reproducible with one command rather than remembered. (This already happened once.)
 
-No other system packages are needed (`libpcl-dev`, `pcl_conversions`, `libeigen3-dev`
-are already present on this machine).
+The script refuses to run if `slam_ws/src/x2_cloud_adapter/` is missing — **that** one
+is ours and is not reproducible from upstream, so recover it from git.
+
+**The patch exists** because upstream's `CMakeLists.txt` does
+`find_package(pcl_ros REQUIRED)` while **nothing in `src/` includes `pcl_ros`**. Rather
+than `apt install ros-humble-pcl-ros` (which needs root), we comment out the three
+references. `patches/point_lio_ros2.patch` is a `git diff`, applied with
+`-p1`. The script fails loudly if it does not apply, rather than building something
+unexpected.
+
+No other system packages are needed — `libpcl-dev`, `pcl_conversions` and
+`libeigen3-dev` are already present.
+
+### What is and is not recoverable
+
+| Path | In git? | If deleted |
+|---|---|---|
+| `slam_ws/src/x2_cloud_adapter/` | **should be** | **not recoverable** — ours |
+| `tools/`, `patches/`, `record_walk.sh`, `README.md` | **should be** | not recoverable |
+| `slam_ws/src/point_lio_ros2/` | ignored | `./tools/bootstrap_slam_ws.sh` |
+| `slam_ws/{build,install,log}/` | ignored | `./tools/bootstrap_slam_ws.sh --fresh` |
+| `data/bags/`, `results/` | ignored | **not recoverable** — re-record on the robot |
+
+`data/bags/` is gitignored and `.gitignore` also lists `*.db3`/`*.mcap`, so
+`git clean -xdf` **will delete recorded bags**. They are large and cannot be
+regenerated without the robot. Back them up outside the repo before any aggressive
+clean.
 
 ## Run
 
@@ -903,27 +1002,186 @@ Faster-LIO, which shares FAST-LIO's `extrinsic_T`/`extrinsic_R` convention
 
 ## Results on `walk_20261007_102515`
 
-| Metric | Point-LIO | leg odometry (reference) |
-|---|---|---|
-| Poses | 1146 @ 8.9 Hz | — |
-| Net displacement | 2.732 m | 3.084 m |
-| Distance from start at t=119.7 s | **0.251 m** | 0.153 m |
-| z at end (flat floor) | **−0.001 m** | — |
+> **Read the reproducibility section below before quoting any number from here.**
+> The first two runs of the same bag with the same binaries produced wildly different
+> trajectories.
 
-The robot physically returned to within 0.153 m of its start, so **position drift is
-~0.097 m over 120 s and ~19 m travelled — about 0.5 %.** For a legged platform with
-3 g footfall transients that is a good result. The 1 mm vertical drift shows gravity
-alignment is working.
+| Run | Poses (of 1297 clouds) | Return-to-start | z drift at end |
+|---|---|---|---|
+| `--rate 2.0` | 1146 | **0.251 m** (≈0.097 m drift) | −0.001 m |
+| `--rate 1.0` | 1115 | **11.701 m** (diverged) | +1.681 m |
+
+The robot physically returned to within 0.153 m of its start at t=119.7 s, so the
+first run corresponds to ~0.097 m of drift over 120 s and ~19 m travelled (~0.5 %) —
+and the second to complete divergence.
 
 **Do not compare the x/y extents of the two trajectories directly.** Point-LIO's world
 frame is gravity-aligned with an arbitrary yaw at initialisation, while `leg_odom` has
 its own yaw convention, so the two are rotated relative to each other. The
-return-to-start metric above is rotation-invariant, which is why it is the one quoted.
+return-to-start metric is rotation-invariant, which is why it is the one quoted.
 A proper comparison needs Umeyama alignment — not yet done.
 
-**Caveat:** this run played the bag at `--rate 2.0` and produced 1146 poses from 1297
-clouds. Some of the shortfall is initialisation, but some is likely the laptop not
-keeping up at 2×. Re-run at `--rate 1.0` before treating the pose count as meaningful.
+## Reproducibility: SOLVED by a deterministic harness
+
+**Use `./tools/run_point_lio_det.sh` for all evaluation and tuning.** Repeated runs
+are now bit-identical, and it is ~9x faster than real-time replay.
+
+```bash
+./tools/run_point_lio_det.sh data/bags/walk_20261007_102515 det_1
+./tools/eval_trajectory.py results/det_1 data/bags/walk_20261007_102515
+```
+
+Verified across three runs — every shared pose matches exactly:
+
+```
+det_2 vs det_3: 1287/1287 identical poses | max diff 0.000e+00 m
+det_1 vs det_2: 1287/1287 identical poses | max diff 0.000e+00 m
+```
+
+### How it works
+
+Two changes, both required:
+
+1. **`tools/convert_bag.py`** converts the vendor cloud layout to Point-LIO's offline,
+   file-to-file, with no DDS. Cached as `<bag>_plio`. This is the same transform
+   `x2_cloud_adapter` does live; the adapter remains the on-robot path.
+2. **A `bag_path` parameter on Point-LIO** (`patches/point_lio_ros2.patch`). When set,
+   the main loop reads the bag in-process and calls its own `standard_pcl_cbk` /
+   `imu_cbk` in strict stored order, one message per iteration, single threaded. No
+   DDS in the input path at all. `rate.sleep()` is skipped since the loop is
+   data-driven, which is where most of the speedup comes from.
+
+`OMP_NUM_THREADS=1` in the runner also removes floating-point non-associativity from
+OpenMP parallel reductions.
+
+### What this fixed, measurably
+
+| | DDS replay | Deterministic harness |
+|---|---|---|
+| Clouds fed | ~1200 of 1297 | **1297 of 1297** |
+| Poses out | 1201–1238 | **1287–1292** |
+| Wall time | ~130 s | **~15 s** |
+| Run-to-run | **~50 % diverged** | **bit-identical** |
+
+The DDS path was also *losing* scans even with RELIABLE QoS and deep queues — it fed
+~1200 of 1297. The harness feeds all of them.
+
+### New baseline
+
+With deterministic input, `walk_20261007_102515` gives **1.441 m return-to-start
+drift** (reference: robot physically back within 0.153 m), reproducibly. That is worse
+than the best lucky DDS run (0.232 m) and better than the worst (13.2 m) — it is
+simply the true value for this config, which is what makes it useful.
+
+**Known minor gap:** the *output* is still captured with `ros2 bag record` over DDS,
+so the pose count varies by a few at the tail (1292 vs 1287) depending on when the
+recorder attaches. Every shared pose is identical, so this does not affect the
+estimate — but writing a trajectory file directly from the node would remove the last
+bit of nondeterminism from the pipeline.
+
+## Historical: the DDS-replay investigation
+
+Kept because the diagnostic path is instructive, and because the scan-loss and
+point-density findings are real and still apply to the live on-robot pipeline.
+
+Six runs of the same bag with the same binaries:
+
+| Run | Rate | Transport | `point_filter_num` | `fov_degree` | Drops | Return-to-start |
+|---|---|---|---|---|---|---|
+| 1 | 2.0 | lossy | 4 | 180 | yes | 0.097 m |
+| 2 | 1.0 | lossy | 4 | 180 | yes | **11.5 m ✗** |
+| A | 1.0 | lossless | 4 | 180 | none | 1.172 m |
+| B | 1.0 | lossless | 4 | 180 | none | **13.218 m ✗** |
+| C | 1.0 | lossless | **1** | **123** | none | **0.232 m** |
+| D | 1.0 | lossless | **1** | **123** | none | **6.045 m ✗** |
+
+Two hypotheses were tested and **both were wrong as explanations of the variance**:
+
+1. **Dropped scans.** Point-LIO subscribed with `SensorDataQoS()` (BEST_EFFORT,
+   depth 5) and was losing ~180 of 1297 scans. Fixed — both ends are now deep and
+   RELIABLE, and the `[rx]` counter confirms 1200 published / 1200 received. **Runs
+   still diverge.** Worth keeping regardless: silent scan loss is never acceptable.
+2. **Too few points for a narrow FOV.** `point_filter_num: 4` used only ~6.3k of
+   25.2k points. Fixed (now 1). This produced the **best** result so far (0.232 m),
+   so it is worth keeping — but the very next run with the identical config gave
+   6.045 m.
+
+### What the divergence actually looks like
+
+It is a **discrete failure, not accumulating drift**. Run B tracked the reference
+within ±0.1 m until t=30 s, jumped to +4.8 m by t=40 s, and never recovered:
+
+```
+ t(s) |  runA |d|  runB |d| |  ref |d| |   A-err   B-err
+   20 |     3.199     3.149 |    3.245 |  -0.047  -0.096
+   30 |     2.673     2.578 |    2.523 |  +0.151  +0.056
+   40 |     3.987     8.663 |    3.850 |  +0.136  +4.812   <-- B breaks
+```
+
+And **that moment is not exceptional**. Per-10 s windows show t=30–40 has the *lowest*
+max speed (0.396 m/s) of any moving window, and below-average peak acceleration and
+yaw rate. So the trigger is not dynamics — the filter is marginal throughout and fails
+at a semi-random point.
+
+### Remaining suspects (untested)
+
+With scan loss eliminated, the remaining non-determinism is in the replay pipeline
+itself:
+
+- **IMU/cloud interleaving.** Replaying over live DDS means the exact set of 200 Hz
+  IMU samples bundled with each scan by `sync_packages` depends on thread scheduling.
+  Different grouping, different estimate.
+- **OpenMP floating-point non-associativity.** Parallel reductions sum in
+  scheduling-dependent order. Normally this is last-bit noise, but a filter operating
+  near its stability limit amplifies it.
+
+Both are inherent to replaying through DDS. **The fix is a deterministic harness** —
+read the bag in-process and feed Point-LIO's callbacks in strict timestamp order with
+no DDS in the loop. That is the prerequisite for any further tuning. A cheaper
+stopgap worth testing first is replaying at `--rate 0.25` or slower, so each scan's
+IMU batch is fully delivered before the next scan arrives.
+
+### Why the sensor makes this hard
+
+Measured from the data, the E1R is **122.8° × 89.1°, forward-facing** — not a 360°
+spinner — with **median range 3.40 m** (max 12.8 m) in a 5.4 × 5.4 m room. Facing a
+flat wall, translation along the wall and yaw are weakly observable. Combined with 3 g
+footfall transients, the estimator has little margin. This is a genuinely hard
+configuration, and it argues for a larger, more feature-rich recording environment as
+much as for better tuning.
+
+## Earlier finding: the pipeline was losing scans
+
+A single good run does not characterise a SLAM system. Replaying the same bag twice
+gave 0.097 m drift once and 11.5 m the next time, which pointed at non-determinism
+rather than tuning.
+
+**Cause (suspected, under test):** Point-LIO subscribed to the cloud with
+`rclcpp::SensorDataQoS()` — **BEST_EFFORT, depth 5**. At ~786 KB per cloud, a brief
+stall silently drops scans. A dropped scan doubles the inter-scan motion, which on a
+legged platform with 3 g transients is exactly how a filter diverges. And drops depend
+on thread scheduling, so the same input gives different answers run to run.
+
+Both ends are now deep and RELIABLE (`patches/point_lio_ros2.patch` and the adapter),
+and Point-LIO logs how many clouds it actually received:
+
+```
+[rx] clouds received by Point-LIO: N
+```
+
+Compare that against the adapter's published count. **If they differ, scans are being
+lost and no trajectory number from that run means anything.**
+
+Also noted while reading `standard_pcl_cbk`: the loop-back guard is broken upstream.
+
+```cpp
+if (get_time_sec(msg->header.stamp) < last_timestamp_lidar) { ...; return; }
+last_timestamp_lidar = msg->header.stamp.sec;   // only .sec — nanoseconds discarded
+```
+
+It compares a full-precision time against one truncated to whole seconds, so it only
+fires on a backward jump of more than ~1 s. Not our drop source, but it is not doing
+the job it looks like it is doing.
 
 ---
 
@@ -1206,9 +1464,12 @@ output for every type check, and retry the probes up to 3×.
 - **QoS of the `/slam/*` topics** we need to publish — must match what
   `soc0_task_manager` expects, or it will not receive our poses (Lesson 2, in reverse).
   Not yet inspected.
-- **A larger-area dataset.** `walk_20261007_102515` covers only 5.4 × 5.4 m. Fine for
-  a first PoC and it has a loop closure, but too small to characterise drift over
-  distance. A longer corridor traverse would complement it.
+- **Dead-reckoning fusion.** The measured blocker — see *The blocking limitation*
+  above. ZUPT and/or `leg_odometry` fusion, before any more parameter tuning.
+- **Tuning against the deterministic baseline** (1.441 m). Now meaningful, since a
+  config change can be distinguished from a lucky draw.
+- **Trajectory output as a file** rather than a DDS-recorded bag, to remove the last
+  few poses of nondeterminism at the tail.
 - **E1R accelerometer full-scale range.** Walking peaks hit 3.02 g. If configured at
   ±4 g, a faster gait or stumble clips. Readable from DIFOP or the LiDAR's config.
 - **HAL rosbag replay (`data_source: 1`)** — the route from vendor `lidar_raw_data`
@@ -1239,6 +1500,105 @@ output for every type check, and retry the probes up to 3×.
 | How violent is walking for the IMU? | **sd ×600, 0.26–3.02 g, no saturation** | [measured](#walking-dynamics-measured-2026-10-06) |
 | Is walking data recorded automatically? | **Partly** — raw LiDAR + all IMUs yes; `leg_odometry`, `/tf`, `PointCloud2` no | `drp` configs |
 | What is `lidar_raw_data`? | Raw MSOP/DIFOP byte arrays | `LidarRawData.msg` |
+
+---
+
+# The blocking limitation: Point-LIO has no dead-reckoning input
+
+On `office_corridor_02`, Point-LIO drifts **14.1 m over ~31 m travelled (~45 %)**.
+That is not a tuning problem, and the shape of the failure says exactly why.
+
+**Vertical is fine, horizontal is not.** z drift at the end is **0.101 m** over four
+minutes. Gravity is well observed; the failure is purely in the horizontal plane.
+
+**It hallucinates motion when the robot is nearly still.** Distance travelled per 20 s
+window, against leg odometry:
+
+| window | leg odom | Point-LIO | ratio | median range |
+|---|---|---|---|---|
+| 0-20 s | 10.99 m | 10.69 m | 0.97 | 2.50 m |
+| 80-100 s | 13.02 m | 13.49 m | 1.04 | 1.69 m |
+| **100-120 s** | **1.83 m** | **7.66 m** | **4.19** | **1.25 m** |
+| 160-180 s | 13.54 m | 26.56 m | 1.96 | 2.26 m |
+| **220-240 s** | **0.03 m** | **1.62 m** | **60** | 3.37 m |
+
+While actually walking, Point-LIO tracks distance to within a few percent. The error
+concentrates in the windows where the robot **barely moved**: in the last 20 s it
+moved **3 cm** and the estimator reported **1.62 m**.
+
+**Why.** The X2 Ultra stands by actively balancing, so a "stationary" robot still
+produces real footfall and oscillation on the IMU. Point-LIO propagates on that IMU.
+The LiDAR should correct it — but with a 123 deg FOV at 1.25 m median range against
+close corridor walls, scan matching slides freely along those surfaces and cannot.
+Nothing in the filter says "you are not translating."
+
+## What this means for the project
+
+**LiDAR-inertial odometry alone is not sufficient on this platform.** That is not a
+Point-LIO defect; it is the wrong tool for a legged robot in close quarters, used
+alone.
+
+Note what the vendor does. Their `LocalizationModule` config has:
+
+```yaml
+sub_dr_topic: /aima/mc/leg_odometry      # dead reckoning
+```
+
+Their Faster-LIO-based stack consumes **leg odometry as a dead-reckoning prior**.
+Point-LIO has no such input — it is LiDAR + IMU only.
+
+Leg odometry's strengths are exactly LIO's weaknesses here:
+
+| | leg odometry | LiDAR-inertial |
+|---|---|---|
+| Stationary | **no drift** (foot contact) | drifts (IMU noise + degenerate geometry) |
+| Short-term translation | good | good when geometry is rich |
+| Long-term / global | drifts, no loop closure | corrects against the map |
+| Degenerate geometry | **unaffected** | fails |
+
+They are complementary. Fusing them is the architecture this robot needs, and the
+vendor reached the same conclusion independently.
+
+### Options, roughly in order of effort
+
+1. **Zero-velocity updates (ZUPT)** — detect "not walking" from the `leg_odometry`
+   twist or joint states and clamp velocity. Cheap, and targets the single biggest
+   measured error source.
+2. **Fuse after the fact** — run Point-LIO, then combine its pose with
+   `/aima/mc/leg_odometry` in a pose graph or EKF. No changes inside Point-LIO.
+3. **Add a DR factor inside Point-LIO** — most faithful to the vendor architecture,
+   most work.
+
+Try 1 and 2 before any further parameter tuning: the table above shows tuning cannot
+supply a missing constraint.
+
+
+# What to record next
+
+The limitation is **geometry, not duration**. More minutes in the same room gives the
+same weak constraints.
+
+Measured: the E1R is **122.8 deg x 89.1 deg forward-facing**, median range **3.40 m**,
+in a 5.4 x 5.4 m space. The failure mode is a large flat surface filling the FOV: one
+dominant plane constrains its own normal and little else, leaving translation along
+the surface and yaw weakly observable.
+
+**Most useful next recording — one loop, 3-5 minutes:**
+
+1. **office -> corridor -> back to start.** Varied geometry, real distance, and a
+   genuine loop closure over a longer baseline than the current 5.4 m room.
+2. **Keep structure in view.** Desks, chairs, doorways, corners, boxes. Clutter helps
+   LIO; a clean empty room hurts it.
+3. **Avoid long stretches facing a blank wall**, and especially avoid turning in place
+   while facing one — that is the degenerate case.
+4. If the corridor is long and bare, **a single there-and-back** beats looping inside it.
+
+**On corridors:** expect them to be *harder*, not easier. Two long parallel walls leave
+motion along the corridor axis weakly observable, and the classic symptom is drift that
+stretches the trajectory lengthwise. Worth recording precisely because it tests drift
+over distance — but it is a harder case, not a fix for the current one.
+
+Record with `./record_walk.sh -n office_corridor_loop_01`.
 
 # Safety notes
 
