@@ -1,0 +1,79 @@
+# Point-LIO configuration for the AgiBot X2 Ultra (RoboSense E1R + built-in IMU).
+#
+# Values marked [vendor] are taken from AgiBot's own Faster-LIO config,
+# /agibot/software/nav/config/slam/paramsE1R.yaml (the `mapping:` block ONLY —
+# the `agi_sam:` block in that file is dead LIO-SAM config with extrinsics that
+# differ by a factor of 10).
+# Values marked [measured] come from analysing data/bags/walk_20261007_102515.
+
+/**:
+    ros__parameters:
+        common:
+            # Output of x2_cloud_adapter, NOT the raw vendor topic: the vendor cloud
+            # has `ring` and `timestamp` where Point-LIO expects `time` and `ring`.
+            lid_topic: "/x2/points"
+            imu_topic: "/aima/hal/sensor/lidar_chest_front/imu"
+            con_frame: false
+            con_frame_num: 1
+            cut_frame: false
+            cut_frame_time_interval: 0.1
+            # LiDAR and IMU share one PTP-disciplined clock; measured stream start
+            # offset was 52 ms across cloud/IMU/odom, i.e. no systematic lag.
+            time_lag_imu_to_lidar: 0.0
+
+        preprocess:
+            lidar_type: 2          # 2 = VELO16 = the Velodyne-style layout we emit
+            scan_line: 96          # [measured] E1R reports ring 0..95, NOT 16
+            timestamp_unit: 0      # 0 = seconds; the adapter converts ns -> s
+            # [measured] observed point range 1.05-12.8 m indoors. The stock 2.0
+            # would discard a large fraction of a small room.
+            blind: 0.5
+
+        mapping:
+            imu_en: true
+            start_in_aggressive_motion: false
+            extrinsic_est_en: false   # [vendor] trusts the factory calibration
+            imu_time_inte: 0.005      # [measured] 200 Hz IMU (stock 0.01 = 100 Hz)
+            # [measured] walking peaks reach 29.5 m/s^2. The stock satu_acc of 30.0
+            # would classify real footfall impacts as saturated and discard them.
+            # We verified the IMU is NOT saturating (mean |a| stays at g), so raise it.
+            satu_acc: 40.0
+            satu_gyro: 35.0           # [measured] walking peaks 3.8 rad/s - headroom ok
+            acc_norm: 9.81            # [measured] IMU reports m/s^2, not g
+            lidar_meas_cov: 0.01
+            acc_cov_output: 500.0
+            gyr_cov_output: 1000.0
+            b_acc_cov: 0.0001         # [vendor] kalibr-derived
+            b_gyr_cov: 0.0001         # [vendor] kalibr-derived
+            imu_meas_acc_cov: 0.1
+            imu_meas_omg_cov: 0.1
+            gyr_cov_input: 0.01       # [vendor] gyr_cov
+            acc_cov_input: 0.1        # [vendor] acc_cov
+            plane_thr: 0.1            # [vendor] esti_plane_threshold
+            match_s: 81.0
+            fov_degree: 123.0        # [measured] actual azimuth FOV 122.8 deg, not 360
+            det_range: 30.0           # [measured] max observed range 12.8 m
+            gravity_align: true
+            gravity: [ 0.0, 0.0, -9.810 ]
+            gravity_init: [ 0.0, 0.0, -9.810 ]
+
+            # [vendor] T_il, LiDAR -> IMU. Confirmed three independent ways:
+            #   /tf_static              (-0.0113, +0.0043, +0.0157)
+            #   HAL log read from DIFOP (-0.011,   0.004,   0.016)
+            #   paramsE1R.yaml          below (same magnitudes, permuted axes)
+            extrinsic_T: [ 0.00427, -0.01575, -0.01121 ]
+            extrinsic_R: [  0.005948, -0.999979,  0.002737,
+                            0.000525,  0.002741,  0.999960,
+                           -0.999982, -0.005946,  0.000542 ]
+
+        odometry:
+            publish_odometry_without_downsample: false
+
+        publish:
+            path_en: true
+            scan_publish_en: true
+            scan_bodyframe_pub_en: false
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1
