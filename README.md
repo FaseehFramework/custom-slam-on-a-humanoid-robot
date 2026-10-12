@@ -375,6 +375,38 @@ Subscription count: 1`). The slot is vacant and well-defined.
 | `/tf` | `tf2_msgs/msg/TFMessage` |
 | `/heartbeat/loc_state` | liveness (MQTT + ROS 2) |
 
+### Measured subscriber QoS (2026-10-12)
+
+Probed live from both soc1 and soc0, with retries:
+
+| Topic | Publishers | Subscribers | Reliability | Durability |
+|---|---|---|---|---|
+| `/slam/localization/odometry` | 0 | 1 | BEST_EFFORT | VOLATILE |
+| `/slam/mapping/odometry` | 0 | 1 | BEST_EFFORT | VOLATILE |
+| `/slam/lidar_odom` | 0 | 1 | BEST_EFFORT | VOLATILE |
+
+So we publish **RELIABLE + TRANSIENT_LOCAL**: a RELIABLE writer also satisfies
+BEST_EFFORT readers and a TRANSIENT_LOCAL writer also satisfies VOLATILE readers, so
+that is the strictly most compatible choice and survives a stricter subscriber
+appearing later. (Lesson 2 in reverse — a mismatch here fails silently.)
+
+**Two corrections to the claim above.** This document previously stated that
+`soc0_task_manager` subscribes to `/slam/localization/odometry`. What is actually
+measured is that the subscriber on that topic is **`soc1_drp_ros2_node3065`** — the
+vendor's *recorder*. `/soc0_task_manager3345` does appear in `ros2 node list`, so it is
+running, but repeated `ros2 node info` calls from both panels failed to enumerate its
+subscriptions (cross-panel discovery here is intermittent and asymmetric: the node was
+visible from soc1 on one attempt and from neither on later ones). **Whether
+`task_manager` consumes these topics is unconfirmed.** What is confirmed is that the
+slot is vacant — nothing publishes — and that a vendor recorder is listening, which
+conveniently means anything we publish lands in the vendor's own bags.
+
+Second: **`/heartbeat/loc_state` is not a plain ROS 2 topic.** The only heartbeat on
+the bus is `/ota/gateway/heartbeat/pb_3Aaimdk_2Eprotocol_2EOTAGatewayHeartbeatChannel`
+with type `ros2_plugin_proto/msg/RosMsgWrapper` — an AimRT protobuf channel. Producing
+it needs the aimdk wrapper encoding, which we have not implemented. Not required for
+publishing odometry.
+
 `/aima/mc/leg_odometry` publishes at **~167 Hz even while the robot is idle and
 damped** — it does not require the robot to be walking.
 
@@ -1559,19 +1591,295 @@ Leg odometry's strengths are exactly LIO's weaknesses here:
 They are complementary. Fusing them is the architecture this robot needs, and the
 vendor reached the same conclusion independently.
 
-### Options, roughly in order of effort
+### Where the error actually comes from
 
-1. **Zero-velocity updates (ZUPT)** — detect "not walking" from the `leg_odometry`
-   twist or joint states and clamp velocity. Cheap, and targets the single biggest
-   measured error source.
-2. **Fuse after the fact** — run Point-LIO, then combine its pose with
-   `/aima/mc/leg_odometry` in a pose graph or EKF. No changes inside Point-LIO.
-3. **Add a DR factor inside Point-LIO** — most faithful to the vendor architecture,
-   most work.
+The ratio table above is misleading on its own: ratios blow up when the denominator is
+small. Measuring **displacement error per 20 s window** (magnitude, so invariant to the
+yaw offset between the two frames) gives the real picture:
 
-Try 1 and 2 before any further parameter tuning: the table above shows tuning cannot
-supply a missing constraint.
+| window | ref | Point-LIO | error | |
+|---|---|---|---|---|
+| 160-180 s | 10.17 m | **18.10 m** | **+7.93 m** | fast (0.5 m/s) |
+| 100-120 s | 0.50 m | 2.81 m | +2.32 m | stationary |
+| 220-240 s | 0.00 m | 0.03 m | **+0.02 m** | stationary |
 
+| source | error | share |
+|---|---|---|
+| stationary windows (<0.1 m/s) | 2.47 m | **17 %** |
+| fast windows (>0.45 m/s) | 7.93 m | **55 %** |
+| everything else | 4.05 m | 28 % |
+
+The stationary windows are *jittery* but barely drift: in the last 20 s the estimate
+wanders 1.62 m of path yet ends 0.02 m from where it started.
+
+### The dominant failure is a discrete slip, not drift
+
+| t | ref step | Point-LIO step | error | p90 range |
+|---|---|---|---|---|
+| 174 s | 1.43 m | 2.79 m | +1.36 | 3.2 m |
+| **176 s** | **0.92 m** | **8.00 m** | **+7.08** | **2.8 m** |
+| 178 s | 0.92 m | 5.13 m | +4.21 | 4.1 m |
+| 180 s | 0.03 m | 0.05 m | +0.03 | 3.9 m |
+
+**8 m in 2 s** — 4 m/s, against a platform maximum of 0.75 m/s. A scan-match teleport,
+not accumulated drift. Point count was healthy (25.9k); what changed is that p90 range
+collapsed from 6.0 m to 2.8 m, i.e. the robot was boxed in with nothing distant to
+anchor against. It tracks normally again immediately afterwards, carrying a permanent
+8 m offset.
+
+### Decision: DR factor, not ZUPT
+
+1. **ZUPT addresses 17 % of the error** — measured, not estimated.
+2. **It cannot touch the dominant failure.** At t=176 the robot was walking normally;
+   ZUPT never engages. Only a translation prior catches "I claim 8 m, DR says 0.92 m".
+3. **ZUPT is a degenerate special case of a DR factor.** With leg odometry reporting
+   zero motion, a DR constraint *is* a zero-velocity update. Build DR, get ZUPT free.
+4. **Correct inside the filter, not after it.** Post-hoc fusion fixes the trajectory,
+   but Point-LIO's map has already absorbed the jump. We want mapping, not just odometry.
+
+### Measured payoff (`tools/dr_payoff.py`, 2026-10-12)
+
+Before committing to ESKF surgery we bounded the payoff offline. The test keeps
+Point-LIO's per-scan *direction* and rescales the *magnitude* to leg odometry, then
+re-integrates. Only magnitudes are compared, so the unknown yaw offset between
+`leg_odom` and `camera_init` never enters. It cannot correct orientation error, so it
+is a **lower** bound on what an in-filter DR factor recovers.
+
+Metric: distance from start at t=206.5 s, where leg odometry says the robot was
+physically 1.84 m from where it began.
+
+| variant | return-to-start error | recovered |
+|---|---|---|
+| baseline (no DR) | **14.22 m** | — |
+| speed cap 1.0x v_max | 3.20 m | 77 % |
+| speed cap 2.0x v_max | 5.46 m | 62 % |
+| ratio gate 1.5x leg_odom | 2.10 m | 85 % |
+| **ratio gate 2.0x leg_odom** | **1.56 m** | **89 %** |
+| ratio gate 5.0x leg_odom | 2.51 m | 82 % |
+| always (pure scale-DR) | 1.73 m | 88 % |
+
+**The result is not threshold-sensitive.** Every variant recovers 62-89 %, and the
+ratio-gate family sits in a flat basin (1.56-2.51 m) across a 3.3x range of gates.
+There is no cherry-picked parameter here.
+
+Attribution, by correcting one window at a time:
+
+| corrected window | error | recovered |
+|---|---|---|
+| only 174-180 s (the slip) | 2.91 m | **80 %** |
+| everything except the slip | 10.31 m | 27 % |
+| only after the slip | 14.11 m | 1 % |
+| everything | 1.73 m | 88 % |
+
+**Six seconds of a 237 s run hold 80 % of the error.** This supersedes the earlier
+55 % figure, which came from coarser 20 s windows.
+
+Two things follow:
+
+- **Total excess path is 40.6 m but position error is only 14.2 m**, because broad
+  per-step inflation (Point-LIO's path is 1.33x leg odometry's) points in random
+  directions and largely cancels. The slip does not cancel: ten consecutive 100 ms
+  steps at 4.3-5.4 m/s, all one direction. Coherence, not magnitude, is what hurts.
+- **The constraint only has to be right during the slip.** Leg odometry reported
+  0.02-0.08 m per 100 ms throughout (normal walking) while Point-LIO reported
+  0.43-0.54 m. The disagreement is 6-25x and unmissable by any sane gate.
+
+Conclusion: **the DR factor is justified.** Implement it in Point-LIO's ESKF.
+
+
+# The DR factor, implemented (2026-10-12)
+
+## Verifying the assumptions first
+
+Before writing filter code we re-checked what the plan rested on. Two of four
+assumptions were wrong, and both changed the design.
+
+| assumption | verdict |
+|---|---|
+| the slip is a scan-match failure, not a data gap | **holds** — 100.0 ms cloud intervals, ~25 800 pts/scan throughout, no gap |
+| leg odometry is healthy during the slip | **holds** — 170 Hz, max gap 12.1 ms, 2379/2379 distinct, max 0.748 m/s vs a 0.75 m/s spec |
+| the error is translation-only | **WRONG** — yaw swings +-10-18 deg per 100 ms step, 100-170 deg/s |
+| it is a discrete outlier | **WRONG** — a 4.9 s contiguous runaway (t=172.6-177.5), and **30 % of all scans** exceed the platform maximum, in 229 separate episodes |
+
+The last two killed the "gate the outlier" plan. The sweep had already said so without
+our noticing: the *best gate threshold differed per dataset* (2.0x vs 1.5x) while the
+no-threshold `always` variant scored near-best on both — an overfitting signature. The
+right primitive is a **continuous velocity observation**, not a gate.
+
+## Implementation
+
+Velocity is state index 12..14 of the 30-state output filter (`state_output`:
+pos 0, rot 3, offset_R 6, offset_T 9, **vel 12**, omg 15, acc 18, grav 21, bg 24, ba 27).
+The residual `z = R*v_legodom - v_state` is linear in that sub-state, so H is an identity
+block and the Kalman gain is a slice of P — `update_iterated_dyn_share_DR()` mirrors the
+existing `update_iterated_dyn_share_IMU()` almost line for line.
+
+`leg_odometry` is already in the `lidar_imu_chest_front` frame, the same frame as the
+IMU, so **no extrinsic is needed**; only `twist` is used, never `pose`, which also keeps
+the unknown `leg_odom`→`camera_init` yaw offset out of the problem entirely.
+
+Files: `esekfom.hpp` (update + `z_DR`/`R_DR` + third model slot), `Estimator.cpp`
+(`h_model_DR_output`), `laserMapping.cpp` (buffer, BEST_EFFORT subscription, call site
+before the LiDAR update, bag-replay feed), `parameters.cpp`. All in
+`patches/point_lio_ros2.patch`, verified to apply to a fresh upstream clone.
+
+## Results — `office_corridor_02`
+
+| | return-to-start | path ratio | peak speed |
+|---|---|---|---|
+| `dr_mode: 0` (baseline) | 13.75 m | 1.34x | **5.395 m/s** |
+| **`dr_mode: 1`** | **0.79 m** | **1.00x** | **0.971 m/s** |
+| `dr_mode: 2` | 29.76 m | 0.96x | — |
+
+- **Inert when off.** `dr_mode:=0` reproduces the pre-DR baseline on 2370/2370 poses,
+  max diff 0.000e+00 — the changes cannot affect upstream behaviour.
+- **Deterministic.** Two `dr_mode: 1` runs: 2370/2370 bit-identical.
+- Peak speed drops below the platform maximum, and the 1.34x path inflation vanishes —
+  confirming the inflation was velocity-state noise, not geometry.
+- On `walk_20261007_102515`, peak speed 3.762 -> 1.034 m/s, but the endpoint is
+  unchanged (2.752 -> 2.771 m): that run's excursions happened to cancel instead of
+  accumulating. **DR prevents divergence; it does not improve a run that never diverged.**
+
+## Two traps worth remembering
+
+**The offline proxy inverted the ranking.** `dr_payoff.py` scored pure scale-DR at 88 %,
+and `dr_mode: 2` is exactly that, in-filter — where it measured **29.76 m, worse than no
+DR at all**. Scaling along the filter's own velocity direction is a feedback loop: a
+wrong direction is driven confidently at the correct speed. Post-hoc rescaling of an
+already-fixed trajectory has no such term. The proxy predicted the payoff *magnitude*
+well and the *design ranking* not at all.
+
+**The `err` column is circular.** It measures distance from leg odometry's own answer, so
+it rewards a passthrough. Tuning `dr_vel_cov` on it selects the degenerate solution — and
+visibly does: cov 1e-4 scores best on `err` while sitting closest to leg odometry's own
+1.858 m endpoint, the passthrough signature. Judge by end displacement and peak speed.
+
+Covariance sensitivity, for the record:
+
+| `dr_vel_cov` | 1e-4 | 1e-3 | 1e-2 | 1e-1 | 1.0 |
+|---|---|---|---|---|---|
+| err vs leg odom | 0.26 | 0.81 | 0.79 | 1.40 | 0.71 |
+| path ratio | 0.97x | 0.98x | 1.00x | 1.03x | 1.14x |
+
+Insensitive across four orders of magnitude. Even cov 1.0 — a sigma looser than the
+platform's own top speed, so barely able to influence the solution — still takes 13.75 m
+to 0.71 m. That is what distinguishes *constraining* from *dominating*.
+
+## The honest caveat
+
+**There is no independent ground truth in any of these numbers.** The endpoint is scored
+against leg odometry, or against an assumed return-to-start. "0.79 m" means *agrees with
+leg odometry to 0.79 m*, not *accurate to 0.79 m*, and leg odometry is itself a
+dead-reckoning estimate that drifts. What is solid and does not depend on a reference:
+the baseline produced 5.4 m/s on a 0.75 m/s platform, which is impossible, and with DR it
+does not. The next recording should start and end on a physically marked spot.
+
+
+# Publishing into the vendor slot
+
+`x2_cloud_adapter/slam_publisher` relays `/aft_mapped_to_init` to all three `/slam/*`
+topics. It is a separate relay rather than a Point-LIO patch so the vendor integration
+is testable offline, survives an upstream bump, and keeps our patch small.
+
+```bash
+ros2 launch x2_cloud_adapter x2_point_lio.launch.py publish_slam:=true
+ros2 run x2_cloud_adapter slam_publisher          # or standalone
+```
+
+**It is off by default** (`publish_slam:=false`). Everything else we have built is
+read-only; this is the first component that *writes* to the robot's bus, so it is opt-in.
+
+Verified offline end to end: replaying `results/dr_m1` relayed **2375/2375** poses to
+each of the three topics with no loss.
+
+Open, and deliberately not guessed at:
+
+- **Frame ids.** We pass `camera_init -> aft_mapped` through unchanged. What
+  `soc0_task_manager` expects is unconfirmed; `header_frame_id`/`child_frame_id`
+  override it when we find out.
+- **Localization vs mapping.** The vendor's stack separates pose-in-a-prior-map from
+  pose-while-building. We have one estimate and no prior map, so both topics currently
+  carry the same message. Revisit when relocalisation against a saved map exists.
+- **`publish_tf` defaults off.** `/tf` on the robot is vendor-owned; do not contend
+  with it until we know which frames are free.
+
+# Ground truth: the marked loop-closure walk
+
+Every accuracy number in this document is scored against leg odometry, which is itself a
+drifting dead-reckoning estimate, or against an assumed return-to-start. Neither is
+truth. A marked walk fixes that: if the robot starts and ends on the same spot on the
+floor, true displacement between those two moments is zero, so whatever the estimator
+reports is real error.
+
+## Protocol
+
+1. **Mark the floor.** Tape an outline of both feet, plus a heading arrow. Position is
+   what matters most; the heading mark also gives a yaw check.
+2. Place the robot on the mark.
+3. Start recording: `./record_walk.sh -n marked_loop_01`
+4. **Stand still ~10 s.** Do not skip this — the analysis needs a dwell to average over,
+   and it is how the two endpoints are found automatically.
+5. Walk the loop. Prefer varied geometry (office -> corridor -> back); the corridor
+   alone is where scan matching degenerates, which is what we want to measure.
+6. Return to the mark and align the feet and heading as precisely as you can.
+7. **Stand still ~10 s.**
+8. Stop (ENTER), then `./record_walk.sh --fetch`.
+
+**Record how precisely you repositioned it** (e.g. "within ~3 cm"). That is the error
+floor — a 0.05 m closure result means nothing if the robot was replaced to +-0.10 m.
+
+## Analysis
+
+```bash
+./tools/run_point_lio_det.sh data/bags/marked_loop_01 marked_01
+./tools/eval_loop_closure.py results/marked_01 data/bags/marked_loop_01
+```
+
+The dwells are detected from leg-odometry speed (`< 0.05 m/s` for `>= 3 s`), so no
+timestamps need writing down. The tool reports closure drift for both Point-LIO and leg
+odometry, split into xy / z / yaw, plus drift as a percentage of path length.
+
+Validated on `office_corridor_02` before use: it correctly reports that run as **not** a
+loop (both estimators put the end ~9.9 m from the start) and finds no dwell at the
+beginning — exactly the gap step 4 closes.
+
+## First ground-truth result: `marked_loop_02` (2026-10-12)
+
+75.6 s, 755 clouds, dwells of 25.3 s and 18.6 s at the two ends, 14.1 m of path between
+them. Repositioning reported by the operator: **left foot 6 cm ahead, right foot 4 cm
+north-east** of their marks.
+
+| source | closure drift | xy | z | yaw |
+|---|---|---|---|---|
+| Point-LIO, `dr_mode: 0` | **0.077 m** | 0.071 | -0.028 | -1.24 deg |
+| Point-LIO, `dr_mode: 1` | **0.088 m** | 0.083 | -0.028 | -3.01 deg |
+| leg odometry | 0.075 m | 0.075 | -0.000 | -7.73 deg |
+
+**Point-LIO closes a 14.1 m loop to within 8 cm — 0.55 % of path.** That is the first
+number in this document scored against the floor rather than against another estimator.
+
+### What this run does *not* show
+
+- **It does not discriminate DR from baseline.** The two differ by 1.1 cm, roughly five
+  times *below* the repositioning floor. Measured reason: the baseline never diverged
+  here — peak speed 1.194 m/s versus **5.395 m/s** on `office_corridor_02`. DR prevents
+  divergence, so on a run with no divergence there is nothing for it to prevent. (DR
+  being nominally 1.1 cm "worse" is noise, not a regression.)
+- **The yaw column is not interpretable.** With a measured stance width of 0.274 m
+  (pelvis->hip_pitch +-0.0713, hip_pitch->hip_roll +-0.0657), the operator's foot offsets
+  imply a fore-aft differential of 0.02-0.10 m depending on the unknown direction of the
+  right foot's offset — a yaw floor of **4.2 to 20.1 deg**. All three yaw figures,
+  including leg odometry's -7.73 deg, sit inside that. Do **not** conclude from this run
+  that leg odometry drifts in yaw.
+- **The position floor is ~5 cm**, so a 0.077 m reading means true error is somewhere
+  around 3-8 cm. Good enough to anchor, not sharp enough to tune against.
+
+### Next ground-truth recording
+
+A marked loop **through the corridor**, where the baseline is known to fail. Only there
+can ground truth confirm or refute the 14.1 m -> 0.79 m DR result, which to date rests
+entirely on agreement with leg odometry. To sharpen the floor, mark each foot
+individually and reposition to both outlines.
 
 # What to record next
 
