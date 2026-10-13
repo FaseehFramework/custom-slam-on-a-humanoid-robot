@@ -21,6 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTDIR="${SCRIPT_DIR}/data/bags"
 
 DURATION=0            # 0 = interactive (stop with ENTER)
+MAX_DURATION=1800     # --detach safety auto-stop (seconds)
+MODE=record           # record | detach | stop | fetch | list
 NAME=""
 KEEP_REMOTE=0
 WITH_VENDOR=0
@@ -45,6 +47,8 @@ EXTRA_TOPICS=(
   /aima/mc/body_pose
   /aima/mc/locomotion/velocity
   /aima/hal/sensor/lidar_chest_front/lidar_status
+  /aft_mapped_to_init                                   # live Point-LIO output,
+                                                        # present only with live_slam.sh
 )
 
 # The point cloud alone is ~7.9 MB/s; everything together is ~12 MB/s.
@@ -61,30 +65,44 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
 
-  -d, --duration SEC   record for SEC seconds, then stop automatically.
-                       Default 0 = record until you press ENTER.
+MODES
+  (default)            record interactively: start, you walk, press ENTER, it copies here.
+      --detach         start recording and EXIT, leaving it running on the robot.
+                       Use this when the link will drop (e.g. walking out of range).
+      --stop           stop a detached recording (leaves the bag on the robot).
+      --fetch [NAME]   stop if running, then copy the bag here and delete it there.
+      --list           list recordings currently on the robot.
+
+OPTIONS
+  -d, --duration SEC   (default mode) record SEC seconds then stop. 0 = until ENTER.
+      --max SEC        (--detach) safety auto-stop on the robot. Default ${MAX_DURATION}.
+                       Prevents filling the disk if you forget to stop it.
   -n, --name NAME      bag name. Default: walk_<timestamp>
-  -o, --outdir DIR     where to copy the bag on this PC.
-                       Default: ${OUTDIR}
-  -k, --keep           keep the bag on the robot after copying (default: delete)
-  -V, --with-vendor    also pull the vendor drp .mcap segments covering the run
-                       (raw MSOP packets; they rotate out after ~27 min)
+  -o, --outdir DIR     where to copy on this PC. Default: ${OUTDIR}
+  -k, --keep           keep the bag on the robot after copying
+  -V, --with-vendor    also pull vendor drp .mcap segments covering the run
   -h, --help           this message
 
-Environment:
-  X2_HOST       ssh host alias for the Jetson panel (default: soc1)
-  X2_REMOTE_WS  workspace on the robot (default: /home/run/slam_ws)
+ENVIRONMENT
+  X2_HOST              ssh alias for the Jetson panel. Default: soc1
+                       Use X2_HOST=soc1ap when connected to the robot's own AP.
 
-Examples:
-  ./$(basename "$0")                 # start, walk, press ENTER to stop
-  ./$(basename "$0") -d 120          # record exactly 2 minutes
-  ./$(basename "$0") -n straight_line_01 -V
+WALKING OUT OF RANGE
+  # on the robot's AP (laptop joins the soc0 hotspot):
+  X2_HOST=soc1ap ./$(basename "$0") --detach -n corridor_01 --max 900
+  #   ... walk the robot; the link may drop, recording continues ...
+  X2_HOST=soc1ap ./$(basename "$0") --fetch corridor_01
 EOF
-  exit "${1:-0}"
+  exit "\${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --detach) MODE=detach; shift ;;
+    --stop)   MODE=stop; shift ;;
+    --fetch)  MODE=fetch; [[ "${2:-}" =~ ^[A-Za-z0-9._-]+$ ]] && { NAME="$2"; shift; }; shift ;;
+    --list)   MODE=list; shift ;;
+    --max)    MAX_DURATION="${2:-}"; shift 2 ;;
     -d|--duration) DURATION="${2:-}"; shift 2 ;;
     -n|--name)     NAME="${2:-}"; shift 2 ;;
     -o|--outdir)   OUTDIR="${2:-}"; shift 2 ;;
@@ -96,8 +114,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$DURATION" =~ ^[0-9]+$ ]] || die "--duration must be a whole number of seconds"
-[[ -n "$NAME" ]] || NAME="walk_$(date +%Y%m%d_%H%M%S)"
-[[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "--name may only contain letters, digits, dot, dash, underscore"
+# Only invent a name when we are about to CREATE a recording. For --fetch/--stop an
+# empty NAME means "whatever the robot says is active", read from .rec.name.
+if [[ "$MODE" == "record" || "$MODE" == "detach" ]]; then
+  [[ -n "$NAME" ]] || NAME="walk_$(date +%Y%m%d_%H%M%S)"
+fi
+[[ -z "$NAME" || "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "--name may only contain letters, digits, dot, dash, underscore"
 
 REMOTE_BAG="${REMOTE_WS}/bags/${NAME}"
 PIDFILE="${REMOTE_WS}/.rec.pid"
@@ -120,6 +142,119 @@ clean() { grep -v "\[Warning\]" | grep -v "^20[0-9][0-9]-"; }
 ENVEOF
 
 rsh() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "bash -s" -- "$@"; }
+
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" true 2>/dev/null \
+  || die "cannot ssh to '$HOST'. On the robot's own AP, use X2_HOST=soc1ap."
+
+# --- helpers for detached recordings -------------------------------------------
+remote_active_name() { rsh "$REMOTE_WS" <<'EOF'
+cat "$1/.rec.name" 2>/dev/null
+EOF
+}
+remote_is_running() { rsh "$REMOTE_WS" <<'EOF'
+PID=$(cat "$1/.rec.pid" 2>/dev/null)
+if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then echo yes; else echo no; fi
+EOF
+}
+# SIGINT, then wait for rosbag2 to flush its cache and close the db cleanly.
+remote_stop() { rsh "$REMOTE_WS" <<'EOF'
+WS="$1"; PID=$(cat "$WS/.rec.pid" 2>/dev/null)
+[ -z "$PID" ] && { echo "no pidfile"; exit 0; }
+if kill -0 "$PID" 2>/dev/null; then
+  kill -INT "$PID" 2>/dev/null
+  for i in $(seq 1 90); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+  kill -0 "$PID" 2>/dev/null && kill -TERM "$PID" 2>/dev/null
+  echo "stopped cleanly"
+else
+  echo "was not running"
+fi
+EOF
+}
+
+case "$MODE" in
+  list)
+    say "Recordings on $HOST"
+    rsh "$REMOTE_WS" <<'EOF'
+WS="$1"
+if [ -d "$WS/bags" ]; then
+  cd "$WS/bags" || exit 0
+  found=0
+  for d in */; do
+    [ -d "$d" ] || continue; found=1
+    printf "  %-34s %8s  %s\n" "${d%/}" "$(du -sh "$d" 2>/dev/null | cut -f1)" "$(date -r "$d" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+  done
+  [ $found -eq 0 ] && echo "  (none)"
+else
+  echo "  (no bags directory)"
+fi
+PID=$(cat "$WS/.rec.pid" 2>/dev/null)
+if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+  echo "  >>> RECORDING IN PROGRESS: $(cat "$WS/.rec.name" 2>/dev/null) (pid $PID)"
+fi
+echo "  free: $(df -h "$WS" 2>/dev/null | awk 'NR==2{print $4}')"
+EOF
+    exit 0 ;;
+
+  stop)
+    ACTIVE="$(remote_active_name)"
+    [[ -n "$ACTIVE" ]] || die "no detached recording known on $HOST (try --list)"
+    say "Stopping '${ACTIVE}'"
+    ok "$(remote_stop)"
+    echo "  Bag is on the robot. Retrieve with:  $(basename "$0") --fetch ${ACTIVE}"
+    exit 0 ;;
+
+  fetch)
+    [[ -n "$NAME" ]] || NAME="$(remote_active_name)"
+    [[ -n "$NAME" ]] || die "no name given and no detached recording known (try --list)"
+    REMOTE_BAG="${REMOTE_WS}/bags/${NAME}"
+    if [[ "$(remote_is_running)" == "yes" ]]; then
+      say "Still recording — stopping first"; ok "$(remote_stop)"
+    fi
+    EXISTS="$(rsh "$REMOTE_BAG" <<'EOF'
+[ -d "$1" ] && echo yes || echo no
+EOF
+)"
+    [[ "$EXISTS" == "yes" ]] || die "no bag '${NAME}' on $HOST (try --list)"
+    mkdir -p "$OUTDIR"
+    [[ -e "${OUTDIR}/${NAME}" ]] && die "${OUTDIR}/${NAME} already exists locally"
+    say "Verifying '${NAME}'"
+    INFO="$(rsh "$REMOTE_WS" "$NAME" <<'EOF'
+set +u
+source /opt/ros/humble/setup.bash >/dev/null 2>&1
+AIMDK=/home/agi/aimdk/src/aimdk_msgs/prebuilt_aarch64
+if [ -d "$AIMDK" ]; then
+  export AMENT_PREFIX_PATH="$AIMDK:${AMENT_PREFIX_PATH}"
+  export LD_LIBRARY_PATH="$AIMDK/lib:${LD_LIBRARY_PATH:-}"
+fi
+ros2 bag info "$1/bags/$2" 2>/dev/null | grep -v '\[Warning\]' | grep -v '^20[0-9][0-9]-'
+EOF
+)"
+    [[ -n "$INFO" ]] || die "could not read bag info for ${NAME}"
+    printf '%s\n' "$INFO" | grep -E "Duration|Messages|Count:" | sed 's/^/  /'
+    CC="$(printf '%s\n' "$INFO" | grep -o 'lidar_pointcloud | Type: [^|]* | Count: [0-9]*' | grep -o '[0-9]*$')"
+    [[ "${CC:-0}" -gt 0 ]] || die "ZERO point clouds in ${NAME}; bag left on robot for inspection"
+    ok "${CC} point clouds"
+    say "Copying"
+    scp -q -r "${HOST}:${REMOTE_BAG}" "${OUTDIR}/" || die "scp failed; bag left on robot"
+    RSIZE="$(rsh "$REMOTE_BAG" <<'EOF'
+du -sb "$1" 2>/dev/null | cut -f1
+EOF
+)"
+    LSIZE="$(du -sb "${OUTDIR}/${NAME}" 2>/dev/null | cut -f1)"
+    if [[ -n "$RSIZE" && -n "$LSIZE" && "$RSIZE" != "$LSIZE" ]]; then
+      die "size mismatch (robot ${RSIZE} B, local ${LSIZE} B); bag kept on robot"
+    fi
+    ok "copied $(du -sh "${OUTDIR}/${NAME}" | cut -f1) to ${OUTDIR}/${NAME}"
+    if [[ "$KEEP_REMOTE" -eq 0 ]]; then
+      rsh "$REMOTE_BAG" <<'EOF'
+rm -rf "$1"
+EOF
+      ok "removed from robot"
+    fi
+    echo
+    printf '%s\n' "${GRN}${BOLD}Done.${RST}  ${OUTDIR}/${NAME}"
+    exit 0 ;;
+esac
 
 # ----------------------------------------------------------------- preflight
 say "Preflight"
@@ -242,6 +377,7 @@ mkdir -p "\$WS/bags"
 
 cd "\$WS/bags"
 rm -f "\$WS/.rec.pid" "\$WS/.rec.log"
+printf '%s' "\$BAGNAME" > "\$WS/.rec.name"
 setsid nohup ros2 bag record -o "\$BAGNAME" \
   --qos-profile-overrides-path "\$WS/qos_override.yaml" \
   ${RECORD_TOPICS[*]} \
@@ -271,6 +407,35 @@ EOF
 ok "recorder pid ${RECPID}, subscribed to ${SUBS}/${#RECORD_TOPICS[@]} topics"
 [[ "${SUBS:-0}" -lt "${#RECORD_TOPICS[@]}" ]] && warn "not all topics subscribed yet; check ${REMOTE_WS}/.rec.log if counts look wrong"
 [[ -n "${SKIPPED// /}" ]] && warn "skipped (unresolvable type): ${SKIPPED}"
+
+# ----------------------------------------------------------------- detached mode
+if [[ "$MODE" == "detach" ]]; then
+  # Safety watchdog: the recorder writes ~12 MB/s, so an unattended run that is never
+  # stopped would eventually fill the disk. setsid so it outlives this ssh session.
+  rsh "$REMOTE_WS" "$MAX_DURATION" <<'EOF' >/dev/null
+WS="$1"; MAXD="$2"
+PID=$(cat "$WS/.rec.pid" 2>/dev/null)
+[ -n "$PID" ] || exit 0
+setsid nohup bash -c "sleep $MAXD; kill -INT $PID 2>/dev/null" >/dev/null 2>&1 < /dev/null &
+EOF
+  ok "watchdog armed: auto-stop after ${MAX_DURATION}s"
+  FREE_GB=$(( FREE_MB / 1024 ))
+  echo
+  printf '%s
+' "${GRN}${BOLD}  RECORDING (detached) — '${NAME}'${RST}"
+  printf '%s
+' "  It keeps running on the robot. You can close the laptop or walk out of range."
+  printf '%s
+' "${DIM}  Motors are torque-enabled; keep clear of the legs.${RST}"
+  echo
+  echo "  Disk now: ${FREE_GB} GB free, ~12 MB/s => roughly $(( FREE_MB / 12 / 60 )) min of headroom."
+  echo "  Auto-stops after ${MAX_DURATION}s if you do not stop it sooner."
+  echo
+  echo "  When you are back in range:"
+  echo "    X2_HOST=${HOST} $(basename "$0") --list"
+  echo "    X2_HOST=${HOST} $(basename "$0") --fetch ${NAME}"
+  exit 0
+fi
 
 # Stop the remote recorder even if this script is interrupted.
 stop_recorder() {
