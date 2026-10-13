@@ -39,6 +39,15 @@
             # We verified the IMU is NOT saturating (mean |a| stays at g), so raise it.
             satu_acc: 40.0
             satu_gyro: 35.0           # [measured] walking peaks 3.8 rad/s - headroom ok
+
+            # --- leg-odometry dead-reckoning factor (ours, not upstream) ----
+            # Without it Point-LIO reaches 5.4 m/s against a 0.75 m/s platform
+            # maximum and drifts 13.75 m over 101 m. mode 1 = full body-velocity
+            # vector; mode 2 (speed magnitude only) is UNSTABLE, do not use.
+            dr_mode: 1
+            dr_topic: "/aima/mc/leg_odometry"
+            dr_vel_cov: 0.01
+            dr_max_speed: 1.5
             acc_norm: 9.81            # [measured] IMU reports m/s^2, not g
             lidar_meas_cov: 0.01
             acc_cov_output: 500.0
