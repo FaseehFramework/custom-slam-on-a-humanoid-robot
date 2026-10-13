@@ -1874,12 +1874,171 @@ number in this document scored against the floor rather than against another est
 - **The position floor is ~5 cm**, so a 0.077 m reading means true error is somewhere
   around 3-8 cm. Good enough to anchor, not sharp enough to tune against.
 
+## DR validated against ground truth: `marked_loop_03` (2026-10-12)
+
+82.1 s, 821 clouds, dwells of 25.2 s and 17.2 s, **24.6 m of path** between the marks --
+a longer and harder loop than `marked_loop_02`.
+
+| source | closure drift | xy | z | yaw |
+|---|---|---|---|---|
+| Point-LIO, `dr_mode: 0` | **1.524 m** | 1.520 | +0.103 | **+40.11 deg** |
+| Point-LIO, `dr_mode: 1` | **0.142 m** | 0.139 | +0.029 | **+2.71 deg** |
+| leg odometry | 0.292 m | 0.292 | -0.002 | -7.30 deg |
+
+**The DR factor cuts real, floor-scored error from 1.524 m to 0.142 m -- a 91 %
+reduction, 6.2 % of path down to 0.58 %.** Yaw error falls from 40.11 deg to 2.71 deg.
+
+This is the first validation of the DR factor that does **not** rest on agreement with
+leg odometry, and it settles the two questions `marked_loop_02` could not:
+
+1. **DR works on real ground truth.** The 1.38 m improvement is two orders of magnitude
+   above any plausible repositioning floor (centimetres), so it cannot be an artefact of
+   how the robot was replaced on the mark.
+2. **It is fusion, not a leg-odometry passthrough.** The fused estimate (0.142 m) is
+   **2x better than leg odometry itself** (0.292 m), and its yaw (+2.71 deg) is better
+   than leg odometry's (-7.30 deg). A passthrough cannot beat its own source. This is
+   the ground-truth answer to a question the covariance sweep could only argue
+   indirectly.
+
+### Repositioning floor, and the floor-corrected result
+
+Operator report: **both feet 6 cm behind the mark, no differential** (robot landed well
+inside a 30x30 cm frame). A *uniform* translation does not rotate the robot, so unlike
+`marked_loop_02` the **yaw floor is ~0 here and the yaw column is interpretable**.
+
+Subtracting the known 6 cm backward displacement along each estimator's own end-dwell
+heading gives the estimator's own error:
+
+| source | raw closure | floor-corrected | yaw |
+|---|---|---|---|
+| Point-LIO, `dr_mode: 0` | 1.524 m | **1.560 m** | +40.11 deg |
+| Point-LIO, `dr_mode: 1` | 0.142 m | **0.085 m** | +2.71 deg |
+| leg odometry | 0.292 m | **0.246 m** | -7.30 deg |
+
+**With DR, true closure error is 8.5 cm over 24.6 m -- 0.35 % of path**, and 2.9x better
+than leg odometry. Audited three ways: the result is **bit-identical on re-run**
+(808/808 poses), **completely insensitive to dwell detection** (identical to the
+millimetre across 9 combinations of speed threshold 0.03-0.10 m/s and minimum dwell
+3-10 s), and the estimator's own **wander during the end dwell is only 2.3 mm sd /
+11.6 mm max**, well under the 6 cm repositioning floor. The DR-vs-baseline gap (1.38 m)
+is ~20x the floor and is not in doubt; the DR-vs-leg-odometry gap (0.16 m) is ~2.7x the
+floor, so it is likely but less emphatic. (The correction assumes "behind" means exactly anti-heading and that
+the 6 cm estimate is good; the raw figures are reported alongside so nothing hinges on it.)
+
+**RETRACTED: "the yaw floor is ~0, so leg odometry's -7.30 deg is real drift."** That
+held only if both feet were displaced *exactly* equally. They were placed by eye, so each
+foot's offset carries its own uncertainty, and it is the *differential* that sets the yaw
+floor:
+
+| per-foot uncertainty | differential | yaw floor |
+|---|---|---|
+| +-0.5 cm | +-1.0 cm | +-2.09 deg |
+| +-1.0 cm | +-2.0 cm | +-4.17 deg |
+| +-2.0 cm | +-4.0 cm | +-8.31 deg |
+
+Eyeballing feet against tape is realistically +-1-2 cm, i.e. a yaw floor of **+-4 to
++-8 deg**. Leg odometry's -7.30 deg sits *inside* that. So it is **plausible but not
+established**, and the same applies to Point-LIO's +2.71 deg -- that figure means "not
+detectably wrong", not "accurate to 2.7 deg".
+
+What does survive: **`dr_mode: 0`'s +40.11 deg is 5-10x any plausible floor and is real.**
+
+To make yaw measurable at all, the floor has to be beaten by a longer lever arm than the
+0.274 m stance. Align a straight edge ~1 m long with the robot's sagittal plane and mark
+that instead: +-1 cm over 1 m is +-0.57 deg, an order of magnitude better.
+
+Note the failure mode here is **more attitude than speed**. The baseline peaked at only
+1.442 m/s -- well short of the 5.395 m/s runaway on `office_corridor_02` -- yet still
+produced 40 deg of yaw error and 1.5 m of drift. DR observes velocity only, never
+orientation, so the 40 -> 2.7 deg recovery is indirect: constraining velocity stops the
+filter's state from wandering far enough to take attitude with it.
+
 ### Next ground-truth recording
 
 A marked loop **through the corridor**, where the baseline is known to fail. Only there
 can ground truth confirm or refute the 14.1 m -> 0.79 m DR result, which to date rests
 entirely on agreement with leg odometry. To sharpen the floor, mark each foot
 individually and reposition to both outlines.
+
+# Running live on the robot
+
+Built on soc1 at `/home/run/x2_ultra_slam` (recordings stay in `/home/run/slam_ws`).
+Nothing in `/agibot/` is touched. Build takes ~2 min on the Jetson with
+`COLCON_WORKERS=2` -- cap it, because soc1 also runs the LiDAR HAL. Motion control is on
+**soc0**, so a heavy build here cannot affect motor timing.
+
+```bash
+rsync -az tools patches soc1:/home/run/x2_ultra_slam/
+rsync -az slam_ws/src/x2_cloud_adapter soc1:/home/run/x2_ultra_slam/slam_ws/src/
+ssh soc1 'cd /home/run/x2_ultra_slam && COLCON_WORKERS=2 nice -n 10 ./tools/bootstrap_slam_ws.sh'
+ssh soc1 'ros2 launch x2_cloud_adapter x2_point_lio.launch.py rviz:=false publish_slam:=false'
+```
+
+## Point-LIO publishes /tf unconditionally -- gate it
+
+Upstream calls `tf_br->sendTransform()` on every pose with no flag, broadcasting
+`camera_init -> aft_mapped`. `/tf` is **vendor-owned** on this robot, so our patch adds a
+`publish_tf` parameter (**default `true`**, preserving upstream behaviour exactly) and
+the on-robot launch sets it **`false`**. Verified inert: 809/809 poses bit-identical.
+
+Note `slam_publisher`'s own `publish_tf` does **not** govern this -- that flag only
+affects our relay. They are two separate broadcasters.
+
+## Stage 2 measured (2026-10-12, robot standing, damped)
+
+| metric | result |
+|---|---|
+| `/aft_mapped_to_init` | **241 msgs / 24.0 s = 10.0 Hz** -- matches cloud rate exactly |
+| clouds into Point-LIO (`[rx]`) | **exactly 100 per 10 s** -- no scan loss over DDS |
+| `pointlio_mapping` CPU | 32.4 % of one core (~4 % of the 8-core panel) |
+| `cloud_adapter` CPU | 2.8 % |
+| soc1 load | 5.87 before -> 5.38 during (our load is within noise) |
+| `/tf` pollution | 31 distinct frame pairs, **0** involving camera_init/aft_mapped |
+| DR factor | `[dr] mode 1` confirmed active live |
+
+**The DDS scan loss we saw earlier did not recur.** That loss came from upstream's
+`SensorDataQoS` (BEST_EFFORT, depth 5); our patch subscribes deep RELIABLE
+(`KeepLast(2000)`), and `[rx]` now tracks the 10 Hz cloud rate exactly.
+
+Two `ros2 topic hz` calls returned empty during this run even though the topics were
+demonstrably flowing -- the same discovery flakiness as Lesson 1/2. **Measure by
+recording a bag, not by `hz`.** The numbers above come from a recorded bag.
+
+## Stage 3 done: we published into the vendor slot (2026-10-12)
+
+Run with the robot live, **torque off**, standing. ~45 s of publishing.
+
+| check | result |
+|---|---|
+| data on `/slam/localization/odometry` | **203 msgs in 19.3 s = 10.5 Hz** (recorded) |
+| `/slam/mapping/odometry`, `/slam/lidar_odom` | publisher count 0 -> 1 |
+| relay | `[slam_pub] relayed 400 poses` |
+| revert | publisher count back to 0, **no stray processes** |
+| vendor health after | 34 nodes up, `leg_odometry` 168.5 Hz, LiDAR 10.6 Hz |
+
+**Revert is clean and instant.** `slam_publisher` is one process; killing it removes the
+DDS endpoints and the slot returns to vacant. Nothing was written to disk, no vendor
+config touched, nothing in `/agibot/` modified.
+
+### `ros2 topic info` publisher counts are NOT trustworthy
+
+During the run, `/slam/localization/odometry` reported **`pub=0`** while simultaneously
+delivering 203 recorded messages from that exact topic. `/slam/mapping/odometry` and
+`/slam/lidar_odom` reported `pub=1` correctly in the same pass. Subscriber counts also
+drifted (2 before, 1 during and after).
+
+This is the same discovery unreliability as Lessons 1, 2 and 11, now shown to affect
+**endpoint counts**, not just `hz` and `node info`. Treat `ros2 topic info` as a hint.
+**Only recorded data proves a topic is live.**
+
+### What this run did *not* establish
+
+By choice, no before/during/after instrumentation was recorded, so **whether
+`soc0_task_manager` reacted to our poses is still unknown**. What is established is that
+publishing is mechanically sound, harmless to the vendor stack, and cleanly reversible.
+The robot has a separate, paywalled localization subsystem (`/loc_tele/current_pose`,
+`/loc_tele/relocalization_result`, `/heartbeat/loc_state/...LocStatusHeartBeat`); filling
+the `/slam/*` slot does not activate it, and this run should not be read as doing so.
 
 # What to record next
 
