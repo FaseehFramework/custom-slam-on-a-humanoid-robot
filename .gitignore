@@ -9,3 +9,7 @@ slam_ws/log/
 slam_ws/src/point_lio_ros2/
 tools/__pycache__/
 FASTLIO2_ROS2-main/
+nav_ws/build/
+nav_ws/install/
+nav_ws/log/
+nav_ws/src/
