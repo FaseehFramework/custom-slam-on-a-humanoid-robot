@@ -19,6 +19,8 @@ tools/analyze_bag.py        bag sanity: continuity, IMU dynamics, trajectory, fr
 tools/eval_trajectory.py    estimate vs leg-odometry reference
 tools/eval_loop_closure.py  drift vs a physically marked start/end (real ground truth)
 tools/live_slam.sh          start/stop/status live SLAM on the robot
+tools/loco_cmd_test.py      FIRST MOTION TEST (on soc1): tiny velocity command, interlocked
+tools/decode_locomotion_cmd.py  decode recorded locomotion commands (no aimdk typesupport)
 RUNBOOK_live_walk.md        step-by-step live walking run (hand to the operator)
 tools/dr_payoff.py          bounds what a leg-odometry DR factor would recover
 tools/offset_sweep.py       start-offset ensemble (DR on/off) -- use before any claim
@@ -118,8 +120,20 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
     on `/slam/localization/odometry` is `soc1_drp_ros2_node3065`, the vendor *recorder*.
     task_manager is running but its subscriptions could not be enumerated (cross-panel
     discovery is intermittent and asymmetric). Unconfirmed, not false.
-15. **Never leave a run in `/agibot/data/bag/` uncopied.** It is a ~27 min rolling
+15. **Never command motion except through `tools/loco_cmd_test.py`** (runs on soc1). It is
+    the only code that can move the robot: interlock on `GetMcAction` description
+    `LOCOMOTION_DEFAULT` + RUNNING (the numeric action field reads 0 -- never gate on it),
+    caps 0.2 m/s / 3 s, BEST_EFFORT+VOLATILE (no latching), 5 Hz mode re-check, explicit
+    zeros on every exit after commanding, stop check. **Never call `SetMcAction`** -- the
+    operator changes modes with the remote. Robot needs an operator with the remote's
+    e-stop and clear space for any non-dry run.
+16. **Never leave a run in `/agibot/data/bag/` uncopied.** It is a ~27 min rolling
     buffer; older segments are gone.
+17. **Never run FASTLIO2_ROS2 `pgo`/`localizer` on the robot's bus unremapped.** Both
+    broadcast `map -> camera_init` on `/tf` unconditionally (no switch). Offline: run them
+    under `ROS_LOCALHOST_ONLY=1` with a private `ROS_DOMAIN_ID`. Never run the two together.
+    **Never use their `fastlio2`** (Livox-only input, accel x10). Details: README,
+    "Mapping and relocalisation".
 
 ## Sensor facts worth not re-deriving
 
@@ -194,8 +208,8 @@ preventing the divergence. It **costs mid-walk height** on hard walks (8/11
 worse). Cause UNEXPLAINED. Tested by intervention under the full ensemble and refuted:
 `dr_mode 3` (no direct z row) is worse on 5/5 bags; `dr_mode 4` (body-frame residual WITH
 attitude Jacobian, numerically verified) is a coin flip vs mode 1 (26/55). Keep mode 1.
-Do not re-try either. First confirm the routes are level -- `dz` assumes a flat floor, and
-DR off also shows 0.1-0.15 m mean dz on the hard loops.
+Do not re-try either. Routes confirmed level (max 3 cm threshold), so `dz` is real filter
+error for DR on and off alike -- parked, not dismissed.
 
 **DO NOT** read single-orientation yaw on this robot: the IMU frame sits at pitch ~-85 deg
 (gimbal lock). Use `rel_rot()` (world-frame delta) in `tools/eval_loop_closure.py`. Every
