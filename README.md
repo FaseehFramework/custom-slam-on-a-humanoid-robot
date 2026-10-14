@@ -2256,13 +2256,131 @@ Ensemble, 5 bags x 11 start offsets, modes 3 and 4 against the unchanged baselin
 - **Conclusion: the missing-attitude-Jacobian hypothesis is not supported.** Mode 1 stays the
   default; modes 3 and 4 stay in the code as documented negative results.
 
-### Assumption not yet checked: is the route level?
+### Route check: level (operator, 2026-10-14)
+
+All routes are level; the only relief is a door threshold of at most 3 cm, and the floor
+looks flat (a global tilt of the whole floor cannot be ruled out by eye, but would not
+produce 10-15 cm of mid-walk height change on a loop that returns to its start). So `dz`
+above a few centimetres **is filter error**, for DR on and off alike. The height drift is
+real and unexplained; it is parked, not dismissed (see "Scope decision" below).
+
+### (Original note) Assumption not yet checked: is the route level?
 
 `dz` treats any height change while walking as error, which is only true on a level route.
 DR *off* also shows 0.10-0.15 m mean and ~0.4-0.5 m peak dz on the hard loops, which is a lot
 of error for a chest that should bob a few centimetres. Leg odometry cannot arbitrate: its
 z is identically ~0 (it does not model height). If the hard loops include a ramp, threshold
 or sloped section, part of "the height cost" is real terrain and the metric is wrong there.
+
+# The locomotion command path (2026-10-14, reconnaissance; no motion yet)
+
+Navigation is worthless if the robot cannot follow a velocity command, and that is the
+least-proven link. Findings, all read-only:
+
+- **Topic** `/aima/mc/locomotion/velocity`, type `aimdk_msgs/msg/McLocomotionVelocity`:
+  header, `source` (string), `forward_velocity` m/s (+fwd), `lateral_velocity` m/s (+left),
+  `angular_velocity` (+left). The vendor comment says "m/s" for angular; recorded data shows
+  **rad/s** (commanded -1.000 -> measured -1.066 rad/s yaw rate).
+- **Consumer**: `mc_ros2_node` subscribes BEST_EFFORT/VOLATILE; the other subscribers are
+  the three drp recorders. **Producers**: `soc0_rc` (remote), `soc2_interaction_slave`,
+  `app_proxy`. The motion controller arbitrates between sources.
+- **The remote streams continuously at ~49 Hz while connected, zeros included** (6094
+  messages, 2667 non-zero, all `source: 'rc'`, on `live_walk_01`); absent when the robot was
+  passive. A second publisher will be interleaved with those zeros -- the test reveals how
+  mc arbitrates.
+- **Tracking** on three recorded walks: commanded 0.80 m/s -> 0.68-0.81 m/s measured; commands
+  up to 1.8 are clipped near 0.8 m/s. corr(command, motion) +0.35..+0.75 at 1 s sampling.
+  `tools/decode_locomotion_cmd.py` decodes the topic from any bag (manual CDR; the aimdk
+  type support is aarch64-only). Note: leg odometry's body x is NOT robot-forward (IMU frame
+  pitched ~-85 deg); use world-frame motion.
+- **Motion modes** (`McAction`): 2 SOFT_EMERGENCY_STOP, 3 DAMPING, 4 ZERO_TORQUE,
+  1 PASSIVE, 200 STAND, **300 LOCOMOTION_DEFAULT**, 301 RUN, 302 LOCOMOTION_STEP, ...
+  Set by the remote via `SetMcAction`; queried with `GetMcAction`
+  (`/aimdk_5Fmsgs/srv/GetMcAction`). **The response's numeric `current_action` reads 0
+  while `action_desc` is set** (`'PASSIVE_DEFAULT'`), so gate on the description.
+- Type support for calling it: the vendor's `/agibot/software/common` install (python +
+  C libs), used read-only via PYTHONPATH/LD_LIBRARY_PATH/AMENT_PREFIX_PATH.
+
+`tools/loco_cmd_test.py` is the first-motion test. Its refusal path was exercised in passive
+mode before any motion: it first *did* send 42 zero commands despite refusing and crashed on
+exit -- both fixed; it now exits 3 with nothing published.
+
+# Mapping and relocalisation with FASTLIO2_ROS2 `pgo` + `localizer` (2026-10-14, source read only)
+
+Plan: freeze our odometry (Point-LIO + DR mode 1) and use only two downstream nodes from
+`FASTLIO2_ROS2-main/` (gitignored): `pgo` (loop closure, map save) and `localizer` (ICP
+against a saved map). An external review proposed this; its claims were checked against
+the source, and the load-bearing ones by hand. **Nothing has been built or run yet.**
+
+**Their `fastlio2` cannot replace ours (the review was right):**
+- Its only input is a `livox_ros_driver2/CustomMsg` (`lio_node.cpp:54`); it has no
+  PointCloud2 path.
+- It multiplies acceleration by **10.0** (`lio_node.cpp:125`, Livox g units) and fixes
+  the gravity magnitude at 9.81. Our m/s² IMU would read ~98 m/s² at rest, so it would
+  diverge at once while initialisation still passes silently.
+- It has no leg-odometry input. It is also **not** upstream FAST-LIO2: it is a
+  re-implementation with its own 21-dof IESKF, and `ieskf_max_iter` is read but never applied.
+
+**What pgo and localizer require.** Neither node checks frame-id strings, only geometry.
+- **Inputs:** `PointCloud2` + `nav_msgs/Odometry`, ApproximateTime-synced. Only
+  `pose.pose` is used. All topic names come from YAML and every key is mandatory.
+- **The cloud must be in the odometry's child (IMU) frame, deskewed to the odometry stamp.**
+- **Output is TF `map -> camera_init` only**, unconditional, with no switch, and no pose
+  topic. The localizer re-sends it every 10 ms. On the robot `/tf` is vendor-owned, so
+  both nodes must be remapped there, and a map-frame pose for `/slam/localization/odometry`
+  has to be composed by us (`map->camera_init` x odometry). Never run both nodes together:
+  they broadcast the same edge.
+- **Wall-clock timers:** pgo keeps one pair per 50 ms tick and discards the rest of its
+  queue (`pgo_node.cpp:193-203`); the localizer runs ICP at 1 Hz on the newest scan. DDS
+  playback is therefore non-deterministic. `SimplePGO` and `ICPLocalizer` are ROS-free
+  classes, so a bag-driven offline driver can make it bit-identical.
+
+**Point-LIO's `/cloud_registered_body` does not meet that contract.**
+- It is the **raw** scan with only the static extrinsic applied. `IMU_Processing.hpp:130`
+  copies `meas.lidar` into the "undistorted" cloud, because Point-LIO updates point by
+  point and never deskews.
+- It is disabled in our config anyway (`scan_bodyframe_pub_en: false`).
+- `/cloud_registered` *is* deskewed: each point is mapped with the state at its own time
+  (`laserMapping.cpp:1229-1233`). But it is voxel-downsampled at 0.25 m.
+- Back-projecting `/cloud_registered` with the same-stamp odometry, `p_b = Rᵀ(p_w - t)`,
+  gives a deskewed body-frame scan at scan end.
+- The stamps are bit-identical (`lidar_end_time`) as long as
+  `publish_odometry_without_downsample` stays false.
+
+**Traps found in their code and config:**
+- **Loop time window.** The default `loop_time_tresh: 60` s rules out any loop on
+  `marked_loop_02`, which returns ~57 s after the first key pose. Set it to ~20.
+- **pgo cannot rescue a slip.** `loop_search_radius: 1.0` m, so a run whose closure is
+  off by more than 1 m gets no loop candidate. It only refines good runs; DR's
+  slip-rate gain still matters.
+- **Odometry noise assumes z-up.** The edge noise is rotation 1e-6 and translation
+  (1e-4, 1e-4, 1e-6) in the key pose's *body* frame (`simple_pgo.cpp:54`). Our body z
+  is near-horizontal (IMU pitched ~-85 deg), so the stiffest translation axis is a
+  walking direction, not height. This must be re-expressed for our frame.
+- **`relocalize` initial pose.** The service takes the **map->body (IMU)** pose, composed
+  yaw*roll*pitch, not map->camera_init. An all-zero request therefore starts ICP ~86 deg
+  off. A "relocalize success" reply only means the PCD loaded; ICP success comes from
+  `relocalize_check`.
+- **Loose ICP gates.**
+  - Loop closure accepts fitness <= 0.15 m² (~0.39 m RMS).
+  - The localizer sets no maximum correspondence distance.
+  - The loop variance equals the fitness score, with no robust kernel.
+  - A scan slid along a corridor can pass. Unmeasured.
+- **Forward-only 123 deg FOV.** Loops and relocalisation can only succeed on revisits
+  with a similar heading.
+
+**Build:**
+- GTSAM is not installed (`ros-humble-gtsam` 4.2.0 is available). pgo needs it; the
+  localizer does not.
+- Build only `interface pgo localizer`, outside `slam_ws/src`. Their `fastlio2` needs the
+  Livox driver and Sophus, and `bootstrap_slam_ws.sh` builds everything in `slam_ws/src`.
+- Their launch files also start their fastlio2 and rviz, so use `ros2 run`.
+
+**Data:**
+- No existing result bag contains a cloud; the harness records only `/aft_mapped_to_init`.
+  This is a re-run from the `_plio` inputs, not a re-recording.
+- Replay runs ~16x real time (1292 poses in 8.0 s). Recording 1 MB clouds at that rate
+  needs a deep recorder queue and a check that the cloud count equals the pose count.
 
 # What to record next
 
