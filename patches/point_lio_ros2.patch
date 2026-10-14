@@ -1,0 +1,579 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 75e0b30..0b090e4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,8 +42,9 @@ find_package(rclpy REQUIRED)
+ find_package(geometry_msgs REQUIRED)
+ find_package(nav_msgs REQUIRED)
+ find_package(sensor_msgs REQUIRED)
+-find_package(pcl_ros REQUIRED)
++# find_package(pcl_ros REQUIRED)  # PATCHED: unused (no pcl_ros include in src/), avoids an apt install
+ find_package(pcl_conversions REQUIRED)
++find_package(rosbag2_cpp REQUIRED)        # PATCHED: deterministic in-process bag replay
+ find_package(tf2_ros REQUIRED)
+ find_package(visualization_msgs REQUIRED)
+ # find_package(livox_ros_driver2 REQUIRED)
+@@ -75,8 +76,9 @@ ament_target_dependencies(pointlio_mapping
+         geometry_msgs
+         nav_msgs
+         sensor_msgs
+-        pcl_ros
++#        pcl_ros  # PATCHED: unused
+         pcl_conversions
++        rosbag2_cpp
+         tf2_ros
+         visualization_msgs
+         # livox_ros_driver2
+@@ -101,7 +103,7 @@ ament_export_dependencies(rclcpp
+   geometry_msgs
+   nav_msgs
+   sensor_msgs
+-  pcl_ros
++#  pcl_ros  # PATCHED: unused
+   pcl_conversions
+   tf2_ros
+   visualization_msgs
+diff --git a/include/IKFoM/IKFoM_toolkit/esekfom/esekfom.hpp b/include/IKFoM/IKFoM_toolkit/esekfom/esekfom.hpp
+index 742e117..7b9a5d1 100644
+--- a/include/IKFoM/IKFoM_toolkit/esekfom/esekfom.hpp
++++ b/include/IKFoM/IKFoM_toolkit/esekfom/esekfom.hpp
+@@ -69,6 +69,11 @@ struct dyn_share_modified
+ 	Eigen::Matrix<T, 6, 1> z_IMU;
+ 	Eigen::Matrix<T, 6, 1> R_IMU;
+ 	bool satu_check[6];
++	Eigen::Matrix<T, 3, 1> z_DR;   // leg-odometry velocity residual
++	Eigen::Matrix<T, 3, 1> R_DR;
++	bool dr_valid;
++	bool dr_full;                  // true: use H_DR (general Jacobian), not the vel slice
++	Eigen::Matrix<T, 3, 30> H_DR;
+ };
+ 
+ template<typename state, int process_noise_dof, typename input = state, typename measurement=state, int measurement_noise_dof=0>
+@@ -116,6 +121,11 @@ public:
+ 		x_.build_SEN_state();
+ 	}
+ 	
++	void set_h_dyn_share_modified_3(measurementModel_dyn_share_modified h_dyn_share_in3)
++	{
++		h_dyn_share_modified_3 = h_dyn_share_in3;
++	}
++
+ 	void init_dyn_share_modified_2h(processModel f_in, processMatrix1 f_x_in, measurementModel_dyn_share_modified h_dyn_share_in1, measurementModel_dyn_share_modified h_dyn_share_in2)
+ 	{
+ 		f = f_in;
+@@ -329,6 +339,62 @@ public:
+ 		return;
+ 	}
+ 	
++	// Dead-reckoning velocity update. The residual is linear in the velocity
++	// sub-state (index 12..14 of state_output), so H is an identity block and the
++	// Kalman gain reduces to column/row slices of P, exactly as in the IMU update.
++	bool update_iterated_dyn_share_DR() {
++
++		if (h_dyn_share_modified_3 == nullptr) return false;
++
++		dyn_share_modified<scalar_type> dyn_share;
++		dyn_share.valid = true;
++		dyn_share.dr_valid = true;
++		dyn_share.dr_full = false;
++		h_dyn_share_modified_3(x_, dyn_share);
++		if (!dyn_share.dr_valid) return false;
++
++		Matrix<scalar_type, 3, 1> z = dyn_share.z_DR;
++
++		if (dyn_share.dr_full)
++		{
++			// General Kalman update with a full 3x30 Jacobian (used when the residual
++			// depends on more than the velocity sub-state, e.g. on attitude).
++			const Matrix<double, 3, 30> &H = dyn_share.H_DR;
++			Matrix<double, 30, 3> PHT = P_ * H.transpose();
++			Matrix<double, 3, 3> HPHT = H * PHT;
++			for (int l_ = 0; l_ < 3; l_++) HPHT(l_, l_) += dyn_share.R_DR(l_);
++			Matrix<double, 30, 3> K = PHT * HPHT.inverse();
++			Matrix<scalar_type, n, 1> dx_ = K * z;
++			P_ -= K * (H * P_);
++			x_.boxplus(dx_);
++			return true;
++		}
++
++		Matrix<double, 30, 3> PHT;
++		Matrix<double, 3, 30> HP;
++		Matrix<double, 3, 3> HPHT;
++		PHT.setZero();
++		HP.setZero();
++		HPHT.setZero();
++		for (int l_ = 0; l_ < 3; l_++)
++		{
++			PHT.col(l_) = P_.col(12 + l_);
++			HP.row(l_)  = P_.row(12 + l_);
++		}
++		for (int l_ = 0; l_ < 3; l_++)
++		{
++			HPHT.col(l_) = HP.col(12 + l_);
++			HPHT(l_, l_) += dyn_share.R_DR(l_);
++		}
++		Eigen::Matrix<double, 30, 3> K = PHT * HPHT.inverse();
++
++		Matrix<scalar_type, n, 1> dx_ = K * z;
++
++		P_ -= K * HP;
++		x_.boxplus(dx_);
++		return true;
++	}
++
+ 	void change_x(state &input_state)
+ 	{
+ 		x_ = input_state;
+@@ -377,6 +443,7 @@ private:
+ 	measurementModel_dyn_share_modified *h_dyn_share_modified_1;
+ 
+ 	measurementModel_dyn_share_modified *h_dyn_share_modified_2;
++	measurementModel_dyn_share_modified *h_dyn_share_modified_3 = nullptr;
+ 
+ 	int maximum_iter = 0;
+ 	scalar_type limit[n];
+diff --git a/include/ikd-Tree/ikd_Tree.cpp b/include/ikd-Tree/ikd_Tree.cpp
+index e8c4e86..406e2cd 100644
+--- a/include/ikd-Tree/ikd_Tree.cpp
++++ b/include/ikd-Tree/ikd_Tree.cpp
+@@ -1,5 +1,7 @@
+ #include "ikd_Tree.h"
+ 
++int Multi_Thread_Rebuild_Point_Num = 1500;   // see ikd_Tree.h
++
+ /*
+ Description: ikd-Tree: an incremental k-d tree for robotic applications 
+ Author: Yixi Cai
+diff --git a/include/ikd-Tree/ikd_Tree.h b/include/ikd-Tree/ikd_Tree.h
+index d4b302e..e86fc72 100644
+--- a/include/ikd-Tree/ikd_Tree.h
++++ b/include/ikd-Tree/ikd_Tree.h
+@@ -12,7 +12,12 @@
+ 
+ #define EPSS 1e-6
+ #define Minimal_Unbalanced_Tree_Size 10
+-#define Multi_Thread_Rebuild_Point_Num 1500
++// Subtrees at least this large are rebuilt on a BACKGROUND thread. That makes the map's
++// contents at query time depend on thread timing, so outputs vary with CPU load (measured:
++// 3.6 cm pose divergence, 5 mm closure, across identical replays run concurrently).
++// Deterministic bag replay sets this to INT_MAX so every rebuild is synchronous; live
++// operation keeps upstream's 1500 so large rebuilds never stall the filter.
++extern int Multi_Thread_Rebuild_Point_Num;
+ #define DOWNSAMPLE_SWITCH true
+ #define ForceRebuildPercentage 0.2
+ #define Q_LEN 1000000
+diff --git a/src/Estimator.cpp b/src/Estimator.cpp
+index 912e98b..a45a467 100644
+--- a/src/Estimator.cpp
++++ b/src/Estimator.cpp
+@@ -352,6 +352,83 @@ void h_model_output(state_output &s, esekfom::dyn_share_modified<double> &ekfom_
+ 	effct_feat_num += effect_num_k;
+ }
+ 
++V3D dr_vel_body(0.0, 0.0, 0.0);
++
++// Leg-odometry velocity observation.
++//
++// Measured on office_corridor_02: Point-LIO exceeds the 0.75 m/s platform maximum in
++// 30 % of scans, and during t=172.6-177.5 s it ran away to 5.4 m/s while leg odometry
++// correctly reported normal walking. Velocity is an explicit state here, so the
++// cheapest correction is to observe it directly.
++//
++// mode 1: full vector. Most informative, but rotating the body-frame measurement into
++//         the world uses s.rot, which is itself degraded while the filter is diverging.
++// mode 2: speed magnitude only, applied along the filter's own velocity direction.
++//         Attitude-invariant, and the in-filter analogue of the offline "pure scale-DR"
++//         variant that recovered 88 % / 73 % on our two datasets.
++void h_model_DR_output(state_output &s, esekfom::dyn_share_modified<double> &ekfom_data)
++{
++    ekfom_data.dr_valid = false;
++    ekfom_data.z_DR.setZero();
++    ekfom_data.R_DR << dr_vel_cov, dr_vel_cov, dr_vel_cov;
++
++    const double meas_speed = dr_vel_body.norm();
++    // leg odometry tops out at the platform maximum; anything above it is a fault,
++    // not a measurement, so refuse rather than inject it.
++    if (!std::isfinite(meas_speed) || meas_speed > dr_max_speed) return;
++
++    if (dr_mode == 1)
++    {
++        ekfom_data.z_DR = s.rot * dr_vel_body - s.vel;
++        ekfom_data.dr_valid = true;
++    }
++    else if (dr_mode == 2)
++    {
++        const double est_speed = s.vel.norm();
++        if (est_speed < 1e-6)
++        {
++            // no direction to scale; still pull a standing robot towards rest
++            ekfom_data.z_DR = -s.vel;
++        }
++        else
++        {
++            ekfom_data.z_DR = (s.vel / est_speed) * meas_speed - s.vel;
++        }
++        ekfom_data.dr_valid = true;
++    }
++    else if (dr_mode == 3)
++    {
++        // EXPERIMENT (2026-10-13): mode 1 without its direct world-z row (huge noise, zero
++        // residual). The x/y rows can STILL move v_z, pos_z and attitude through P's
++        // cross-covariances, so this removes only the direct vertical channel -- a null
++        // result here does not clear the z channel (independently reviewed).
++        ekfom_data.z_DR = s.rot * dr_vel_body - s.vel;
++        ekfom_data.z_DR(2) = 0.0;
++        ekfom_data.R_DR(2) = 1e12;
++        ekfom_data.dr_valid = true;
++    }
++    else if (dr_mode == 4)
++    {
++        // EXPERIMENT (2026-10-13): body-frame residual with its attitude Jacobian.
++        //   y = v_leg (body),  h(x) = R^T v,  z = y - h(x)
++        // IKFoM perturbs SO3 on the right (R <- R Exp(dtheta)), so
++        //   Exp(dtheta)^T w ~ w + [w]x dtheta   with w = R^T v
++        //   =>  H_rot = [R^T v]x  (state cols 3..5),  H_vel = R^T  (cols 12..14).
++        // Unlike mode 1, a disagreement can now be explained by attitude as well as
++        // velocity, so DR can correct tilt instead of fighting it.
++        const M3D Rt = s.rot.conjugate().normalized().toRotationMatrix();
++        const V3D w = Rt * s.vel;
++        M3D wx;
++        wx << SKEW_SYM_MATRX(w);
++        ekfom_data.H_DR.setZero();
++        ekfom_data.H_DR.block<3, 3>(0, 3) = wx;
++        ekfom_data.H_DR.block<3, 3>(0, 12) = Rt;
++        ekfom_data.z_DR = dr_vel_body - w;
++        ekfom_data.dr_full = true;
++        ekfom_data.dr_valid = true;
++    }
++}
++
+ void h_model_IMU_output(state_output &s, esekfom::dyn_share_modified<double> &ekfom_data)
+ {
+     std::memset(ekfom_data.satu_check, false, 6);
+diff --git a/src/Estimator.h b/src/Estimator.h
+index 6e0c552..966cd63 100644
+--- a/src/Estimator.h
++++ b/src/Estimator.h
+@@ -110,6 +110,13 @@ void h_model_input(state_input &s, esekfom::dyn_share_modified<double> &ekfom_da
+ void h_model_output(state_output &s, esekfom::dyn_share_modified<double> &ekfom_data);
+ 
+ void h_model_IMU_output(state_output &s, esekfom::dyn_share_modified<double> &ekfom_data);
++void h_model_DR_output(state_output &s, esekfom::dyn_share_modified<double> &ekfom_data);
++
++// Dead-reckoning (leg odometry) measurement, set by laserMapping before the update.
++// dr_vel_body is the body-frame linear velocity from /aima/mc/leg_odometry, which is
++// already expressed in the lidar_imu_chest_front frame -- the same frame as the IMU,
++// so no extrinsic is needed.
++extern V3D dr_vel_body;
+ 
+ void pointBodyToWorld(PointType const *const pi, PointType *const po);
+ 
+diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
+index b6d5f4a..1df6a95 100644
+--- a/src/laserMapping.cpp
++++ b/src/laserMapping.cpp
+@@ -10,6 +10,8 @@
+ #include <Eigen/Core>
+ #include "IMU_Processing.hpp"
+ 
++#include <limits>
++#include <chrono>
+ #include <nav_msgs/msg/odometry.hpp>
+ #include <nav_msgs/msg/path.hpp>
+ #include <visualization_msgs/msg/marker.hpp>
+@@ -18,6 +20,9 @@
+ #include <pcl/point_types.h>
+ #include <pcl/filters/voxel_grid.h>
+ #include <pcl/io/pcd_io.h>
++// PATCHED: deterministic in-process bag replay
++#include <rclcpp/serialization.hpp>
++#include <rosbag2_cpp/readers/sequential_reader.hpp>
+ #include <sensor_msgs/msg/point_cloud2.hpp>
+ #include <tf2_ros/transform_broadcaster.h>
+ #include <geometry_msgs/msg/vector3.hpp>
+@@ -57,6 +62,10 @@ vector<BoxPointType> cub_needrm;
+ deque<PointCloudXYZI::Ptr> lidar_buffer;
+ deque<double> time_buffer;
+ deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_deque;
++// --- leg-odometry dead-reckoning (ours) -------------------------------------
++deque<nav_msgs::msg::Odometry::ConstSharedPtr> dr_deque;
++double dr_last_used_time = -1.0;
++size_t dr_updates = 0;
+ 
+ //surf feature in map
+ PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
+@@ -200,6 +209,9 @@ void lasermap_fov_segment() {
+ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+     mtx_buffer.lock();
+     scan_count++;
++    if (scan_count % 100 == 0) {   // PATCHED: instrumentation
++        RCLCPP_INFO(logger, "[rx] clouds received by Point-LIO: %d", scan_count);
++    }
+     double preprocess_start_time = omp_get_wtime();
+     if (get_time_sec(msg->header.stamp) < last_timestamp_lidar) {
+         RCLCPP_ERROR(logger, "lidar loop back, clear buffer");
+@@ -335,6 +347,16 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+ //     sig_buffer.notify_all();
+ // }
+ 
++void dr_cbk(const nav_msgs::msg::Odometry::SharedPtr msg_in) {
++    if (dr_mode == 0) return;
++    mtx_buffer.lock();
++    dr_deque.emplace_back(msg_in);
++    // bound the buffer; stale dead reckoning is worse than none
++    while (dr_deque.size() > 4000) dr_deque.pop_front();
++    mtx_buffer.unlock();
++    sig_buffer.notify_all();
++}
++
+ void imu_cbk(const sensor_msgs::msg::Imu::SharedPtr msg_in) {
+     publish_count++;
+     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+@@ -689,7 +711,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+ 
+     transform.header.stamp = odomAftMapped.header.stamp;
+ 
+-    tf_br->sendTransform(transform);
++    if (publish_tf) tf_br->sendTransform(transform);
+ }
+ 
+ void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &pubPath) {
+@@ -778,9 +800,28 @@ int main(int argc, char **argv) {
+     // if (p_pre->lidar_type == AVIA) {
+     //     sub_pcl_livox_ = nh->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+     // } else {
+-    sub_pcl = nh->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
++    // PATCHED: SensorDataQoS() is BEST_EFFORT depth 5. At ~786 KB/cloud a brief stall
++    // silently drops scans, which is non-deterministic and can diverge the filter.
++    // Deep + RELIABLE makes offline replay lossless and repeatable.
++    sub_pcl = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
++        lid_topic, rclcpp::QoS(rclcpp::KeepLast(2000)).reliable(), standard_pcl_cbk);
+     // }
+     auto sub_imu = nh->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, imu_cbk);
++    // leg_odometry is published BEST_EFFORT; a BEST_EFFORT reader matches both, a
++    // RELIABLE one would silently receive nothing.
++    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_dr;
++    if (dr_mode != 0 && dr_mode != 1 && dr_mode != 2 && dr_mode != 3 && dr_mode != 4) {
++        // an unsupported mode used to run silently inert while logging "[dr] mode N"
++        RCLCPP_FATAL(logger, "[dr] unsupported mapping.dr_mode %d (valid: 0-4)", dr_mode);
++        return 2;
++    }
++    if (dr_mode != 0) {
++        sub_dr = nh->create_subscription<nav_msgs::msg::Odometry>(
++                dr_topic, rclcpp::QoS(rclcpp::KeepLast(2000)).best_effort(), dr_cbk);
++        kf_output.set_h_dyn_share_modified_3(h_model_DR_output);
++        RCLCPP_INFO(logger, "[dr] mode %d on '%s', cov %.4g, max_speed %.2f m/s",
++                    dr_mode, dr_topic.c_str(), dr_vel_cov, dr_max_speed);
++    }
+ 
+     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFullRes;
+     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFullRes_body;
+@@ -817,12 +858,91 @@ int main(int argc, char **argv) {
+ //------------------------------------------------------------------------------------------------------
+     signal(SIGINT, SigHandle);
+     rclcpp::Rate rate(5000);
++
++    // ---------------- PATCHED: deterministic replay -------------------------
++    // Replaying through DDS is not repeatable: which 200 Hz IMU samples get bundled
++    // with each scan by sync_packages() depends on thread scheduling, so the same bag
++    // gives different trajectories run to run (we measured ~50% divergence).
++    //
++    // With `bag_path` set we read the bag in-process and call the SAME callbacks in
++    // strict stored order, single threaded, with no DDS in the input path. Input is
++    // then bit-identical every run. The bag must already be in Point-LIO's expected
++    // cloud layout -- use tools/convert_bag.py.
++    std::string bag_path = nh->declare_parameter<std::string>("bag_path", "");
++    std::unique_ptr<rosbag2_cpp::readers::SequentialReader> bag_reader;
++    rclcpp::Serialization<sensor_msgs::msg::PointCloud2> pc_ser;
++    rclcpp::Serialization<sensor_msgs::msg::Imu> imu_ser;
++    rclcpp::Serialization<nav_msgs::msg::Odometry> dr_ser;
++    bool bag_mode = !bag_path.empty();
++    if (bag_mode) {
++        // ikd-Tree hands large rebuilds to a background thread, which makes results depend
++        // on CPU load. In replay, rebuild synchronously so output is truly deterministic.
++        Multi_Thread_Rebuild_Point_Num = std::numeric_limits<int>::max();
++    }
++    bool bag_done = false;
++    size_t bag_clouds = 0, bag_imus = 0, bag_drs = 0;
++    if (bag_mode) {
++        bag_reader = std::make_unique<rosbag2_cpp::readers::SequentialReader>();
++        rosbag2_storage::StorageOptions so; so.uri = bag_path; so.storage_id = "sqlite3";
++        rosbag2_cpp::ConverterOptions co; co.input_serialization_format = "cdr";
++        co.output_serialization_format = "cdr";
++        bag_reader->open(so, co);
++        RCLCPP_INFO(logger, "[det] deterministic replay from %s", bag_path.c_str());
++        // The output recorder is a separate process that must discover our publisher before
++        // it receives anything, and /aft_mapped_to_init is VOLATILE: poses published before
++        // it matches are lost. Replay runs faster than real time, so a fixed sleep in the
++        // harness dropped a variable 0.3-2.2 s of leading poses. Wait for the subscriber.
++        {
++            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++            while (rclcpp::ok() && pubOdomAftMapped->get_subscription_count() == 0 &&
++                   std::chrono::steady_clock::now() < deadline) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(50));
++            }
++            RCLCPP_INFO(logger, "[det] output subscribers before first message: %zu",
++                        pubOdomAftMapped->get_subscription_count());
++        }
++        RCLCPP_INFO(logger, "[det] lidar topic '%s', imu topic '%s'",
++                    lid_topic.c_str(), imu_topic.c_str());
++    }
++    // ------------------------------------------------------------------------
++
+     while (rclcpp::ok()) {
+         if (flg_exit) break;
+-        //ros::spinOnce();
+-        rclcpp::executors::SingleThreadedExecutor executor;
+-        executor.add_node(nh);
+-        executor.spin_some(); // 处理当前可用的回调
++
++        if (bag_mode) {
++            // Feed exactly one message per iteration, in stored order.
++            if (bag_reader->has_next()) {
++                auto bm = bag_reader->read_next();
++                if (bm->topic_name == lid_topic) {
++                    auto pc = std::make_shared<sensor_msgs::msg::PointCloud2>();
++                    rclcpp::SerializedMessage sm(*bm->serialized_data);
++                    pc_ser.deserialize_message(&sm, pc.get());
++                    standard_pcl_cbk(pc);
++                    ++bag_clouds;
++                } else if (bm->topic_name == imu_topic) {
++                    auto im = std::make_shared<sensor_msgs::msg::Imu>();
++                    rclcpp::SerializedMessage sm(*bm->serialized_data);
++                    imu_ser.deserialize_message(&sm, im.get());
++                    imu_cbk(im);
++                    ++bag_imus;
++                } else if (dr_mode != 0 && bm->topic_name == dr_topic) {
++                    auto od = std::make_shared<nav_msgs::msg::Odometry>();
++                    rclcpp::SerializedMessage sm(*bm->serialized_data);
++                    dr_ser.deserialize_message(&sm, od.get());
++                    dr_cbk(od);
++                    ++bag_drs;
++                }
++            } else if (!bag_done) {
++                bag_done = true;
++                RCLCPP_INFO(logger, "[det] bag exhausted: %zu clouds, %zu imu, %zu dr fed",
++                            bag_clouds, bag_imus, bag_drs);
++            }
++        } else {
++            //ros::spinOnce();
++            rclcpp::executors::SingleThreadedExecutor executor;
++            executor.add_node(nh);
++            executor.spin_some(); // 处理当前可用的回调
++        }
+ 
+         if (sync_packages(Measures)) {
+             if (flg_first_scan) {
+@@ -1048,6 +1168,30 @@ int main(int argc, char **argv) {
+                         idx += time_seq[k];
+                         continue;
+                     }
++                    // --- leg-odometry dead-reckoning update (ours) ------------
++                    // Applied before the LiDAR update so a diverging velocity state is
++                    // already constrained when scan matching runs on degenerate geometry.
++                    if (dr_mode != 0) {
++                        bool have_dr = false;
++                        nav_msgs::msg::Odometry dr_msg;
++                        mtx_buffer.lock();
++                        while (!dr_deque.empty() &&
++                               get_time_sec(dr_deque.front()->header.stamp) <= time_current) {
++                            dr_msg = *(dr_deque.front());
++                            dr_deque.pop_front();
++                            have_dr = true;
++                        }
++                        mtx_buffer.unlock();
++                        if (have_dr && (dr_last_used_time < 0.0 ||
++                                        time_current - dr_last_used_time >= dr_min_dt)) {
++                            dr_vel_body << dr_msg.twist.twist.linear.x,
++                                           dr_msg.twist.twist.linear.y,
++                                           dr_msg.twist.twist.linear.z;
++                            if (kf_output.update_iterated_dyn_share_DR()) ++dr_updates;
++                            dr_last_used_time = time_current;
++                        }
++                    }
++
+                     if (!kf_output.update_iterated_dyn_share_modified()) {
+                         idx = idx + time_seq[k];
+                         continue;
+@@ -1304,7 +1448,17 @@ int main(int argc, char **argv) {
+                 dump_lio_state_to_log(fp);
+             }
+         }
+-        rate.sleep();
++        // PATCHED: in bag mode the loop is data-driven, so do not throttle; and stop
++        // once the bag is drained and nothing further can be synced.
++        if (bag_mode) {
++            if (bag_done && !sync_packages(Measures)) {
++                RCLCPP_INFO(logger, "[dr] updates applied: %zu", dr_updates);
++                RCLCPP_INFO(logger, "[det] replay complete");
++                break;
++            }
++        } else {
++            rate.sleep();
++        }
+     }
+     //--------------------------save map-----------------------------------
+     /* 1. make sure you have enough memories
+diff --git a/src/parameters.cpp b/src/parameters.cpp
+index 6ab2795..4be517d 100644
+--- a/src/parameters.cpp
++++ b/src/parameters.cpp
+@@ -11,6 +11,10 @@ int pcd_index = 0;
+ std::string lid_topic, imu_topic;
+ bool prop_at_freq_of_imu, check_satu, con_frame, cut_frame;
+ bool use_imu_as_input, space_down_sample, publish_odometry_without_downsample;
++bool publish_tf = true;
++int dr_mode = 0;
++std::string dr_topic;
++double dr_vel_cov, dr_min_dt, dr_max_speed;
+ int init_map_size, con_frame_num;
+ double match_s, satu_acc, satu_gyro, cut_frame_time_interval;
+ float plane_thr;
+@@ -41,6 +45,12 @@ void readParameters(shared_ptr<rclcpp::Node> &nh) {
+ 
+     nh->declare_parameter<bool>("prop_at_freq_of_imu", true);
+     nh->declare_parameter<bool>("use_imu_as_input", true);
++    nh->declare_parameter<bool>("publish_tf", true);
++    nh->declare_parameter<int>("mapping.dr_mode", 0);
++    nh->declare_parameter<std::string>("mapping.dr_topic", "/aima/mc/leg_odometry");
++    nh->declare_parameter<double>("mapping.dr_vel_cov", 0.01);
++    nh->declare_parameter<double>("mapping.dr_min_dt", 0.0);
++    nh->declare_parameter<double>("mapping.dr_max_speed", 1.5);
+     nh->declare_parameter<bool>("check_satu", true);
+     nh->declare_parameter<int>("init_map_size", 100);
+     nh->declare_parameter<bool>("space_down_sample", true);
+@@ -101,6 +111,12 @@ void readParameters(shared_ptr<rclcpp::Node> &nh) {
+ 
+     nh->get_parameter("prop_at_freq_of_imu", prop_at_freq_of_imu);
+     nh->get_parameter("use_imu_as_input", use_imu_as_input);
++    nh->get_parameter("publish_tf", publish_tf);
++    nh->get_parameter("mapping.dr_mode", dr_mode);
++    nh->get_parameter("mapping.dr_topic", dr_topic);
++    nh->get_parameter("mapping.dr_vel_cov", dr_vel_cov);
++    nh->get_parameter("mapping.dr_min_dt", dr_min_dt);
++    nh->get_parameter("mapping.dr_max_speed", dr_max_speed);
+     nh->get_parameter("check_satu", check_satu);
+     nh->get_parameter("init_map_size", init_map_size);
+     nh->get_parameter("space_down_sample", space_down_sample);
+diff --git a/src/parameters.h b/src/parameters.h
+index 03e0c96..2f77b22 100644
+--- a/src/parameters.h
++++ b/src/parameters.h
+@@ -31,6 +31,17 @@ extern float DET_RANGE;
+ extern bool imu_en, gravity_align, non_station_start;
+ extern double imu_time_inte;
+ extern double laser_point_cov, acc_norm;
++// --- leg-odometry dead-reckoning factor (ours, not upstream) ---------------
++// dr_mode: 0 = off (upstream behaviour)
++//          1 = world-frame velocity residual R*v_leg - v, no attitude Jacobian
++//          2 = speed magnitude only -- UNSTABLE (feedback loop), do not use
++//          3 = experiment: mode 1 without the direct world-z row
++//          4 = experiment: body-frame residual v_leg - R^T v WITH attitude Jacobian
++// /tf on the robot is vendor-owned; this gates Point-LIO's unconditional broadcast.
++extern bool publish_tf;
++extern int dr_mode;
++extern std::string dr_topic;
++extern double dr_vel_cov, dr_min_dt, dr_max_speed;
+ extern double acc_cov_input, gyr_cov_input, vel_cov;
+ extern double gyr_cov_output, acc_cov_output, b_gyr_cov, b_acc_cov;
+ extern double imu_meas_acc_cov, imu_meas_omg_cov;
