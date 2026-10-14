@@ -2305,6 +2305,106 @@ least-proven link. Findings, all read-only:
 mode before any motion: it first *did* send 42 zero commands despite refusing and crashed on
 exit -- both fixed; it now exits 3 with nothing published.
 
+Dry run 1 (2026-10-14, robot standing): mode `STAND_DEFAULT status=100`, so the interlock
+(then requiring `LOCOMOTION_DEFAULT`) refused -- 0 messages published. That interlock was
+wrong for this robot, as mc's own logs showed:
+
+## How mc arbitrates motion commands (mc's log + config on soc0, read-only, 2026-10-14)
+
+- **There is no walk-mode toggle.** The PS5 controller just sends velocities. mc switches
+  *itself*: on an accepted motion command from a standing robot it logs `Current state is
+  stable, will auto set moving action: LOCOMOTION_DEFAULT`, and ~3.6 s after the command
+  ends `...is moving, will auto set stable action: STAND_DEFAULT` (11:07:28 -> 11:07:31.7).
+- **Registered input sources**, from `/agibot/software/mc_param/robot/lx2501_3_t2d5/mc.yaml`
+  `input_sources` and the startup log: **rc 80, vr 70, app_proxy 60, interaction 50,
+  pnc 40**, every one with `timeout: 1000` ms. The active one is readable with
+  `GetCurrentInputSource` (it reports `rc`, 80, 1000 ms).
+- **Unregistered sources are dropped.** Our first tool tagged its messages `x2slam_test`;
+  mc logged `Input Source is not enabled, will drop this input directly!!! source:
+  x2slam_test` for each one (49 lines, 10:51:23). Those messages never reached the controller.
+- **`pnc` (planning-and-control) is the vendor's slot for navigation.** Its priority is
+  *below* the remote's, so the operator's stick wins.
+- **mc has its own command watchdog.** Each source's command expires after its timeout
+  (`cmd: ...LocomotionVelocity has been expired, clear command ...`, 3829 occurrences in
+  the logs). This is not yet verified for our source; the live test checks it with leg
+  odometry.
+- **Speed bounds** (`GetMcLocomotionSpeedStatus`): current mode LOW, forward -1.0..0.8 m/s,
+  lateral and angular +-1.0. This explains the clip near 0.8 m/s seen in the recorded walks.
+  MEDIUM 1.2, HIGH 1.8.
+- `McActionStatus`: 0 IDLE, 100 RUNNING, 200 TRANSITION.
+
+`tools/loco_cmd_test.py` was changed to match:
+- It publishes as `pnc`.
+- The start interlock accepts `STAND_DEFAULT` or `LOCOMOTION_DEFAULT` with status RUNNING.
+- While commanding it also accepts TRANSITION, and aborts on any other mode.
+- It logs the current input source before, during and after.
+
+**Dry run 2** (11:16:50, standing, zeros only, as `pnc`):
+- 141 zeros sent, interleaved with 401 `rc` zeros.
+- mc logged **no drop line for `pnc`**: the source is enabled and accepted.
+- No mode change (STAND_DEFAULT throughout); the current source stayed `rc`.
+- Net displacement 0.001 m.
+- Still open, and answered only by the live test: does a non-zero `pnc` command take
+  effect while the remote streams zeros at higher priority?
+
+**Live test 1** (11:26:08, 0.10 m/s for 2 s, as `pnc`; soc0 and soc1 are PTP-aligned):
+
+| time | event |
+|---|---|
+| 09.861 | soc2 interaction agent: `HeadTouchEvent` -> "touch_head" TTS + preset animation `3038` (area 11) sent to mc |
+| 10.332 | our first non-zero command; mc logs `Set new input: source: pnc` in the same ms |
+| 10.507 | mc: `will auto set moving action: LOCOMOTION_DEFAULT` -- then `Cannot exit HeadOnlyController when motion status is not IDLE` x118 |
+| 12.300 | our last non-zero command; zeros until 13.308 |
+| 13.08 | transition completes: LOCOMOTION_DEFAULT RUNNING (2.6 s late) |
+| 13.71 / 15.35 | mc auto-sets STAND_DEFAULT / STAND_DEFAULT RUNNING |
+
+What it showed:
+- **Arbitration works.** A non-zero `pnc` command takes over from the remote's
+  higher-priority zero stream, immediately. `GetCurrentInputSource` reported `pnc`
+  mid-command.
+- **Our command triggers mc's own stand -> walk switch.**
+- **Stop is clean.** The 3 cm of leg-odometry motion is the gait engaging and disengaging
+  after the window.
+- **No forward walking:** the transition outlasted the 2 s window.
+- **The interaction agent on soc2 can block locomotion start for seconds.** A head-touch
+  animation did here. It also requests animations around person detection (a call at
+  11:24:48 followed "Users change: 1 persons"; causation inferred, not proven).
+- **Implication for navigation:** a follower must tolerate a variable start latency, and
+  must not treat "commanded but not moving" as a fault too early.
+
+Tool change: the command is published while waiting (<= `--max-start-wait`, 3 s cap) for
+`LOCOMOTION_DEFAULT` RUNNING. The `--duration` window starts only then, so walking time is
+still <= duration; with no switch it sends zeros and aborts. Exercised offline against
+simulated mode sequences: normal, never switches, e-stop during the wait, e-stop while
+walking, dry run. Every path ends on zeros.
+
+**Live test 2** (11:33:11, 0.10 m/s, 2 s window, hands off the head; operator also saw
+live test 1 switch stand -> walk):
+- **Start was fast.** mc was walking (`LOCOMOTION_DEFAULT` RUNNING) **0.23 s** after our
+  first command and stayed RUNNING for the whole window. Non-zero commands ran 2.20 s
+  (0.23 s start + 2.0 s window), then 1 s of zeros.
+- **Arbitration held.** `pnc` was the current source throughout (101 non-zero `pnc`
+  commands against 411 `rc` zeros).
+- **Motion, from leg odometry:**
+  - The robot progressed ~7 cm along its net direction during the window, with ~+-3 cm of
+    gait sway superimposed.
+  - Speed in the 2nd half of the window was **0.052 m/s against 0.10 commanded**.
+  - Net displacement after settling: **4.7 cm** (expected ~20 cm at full tracking).
+- **Stopped.** 0.009 m/s at 2-4 s after the zeros. mc returned to stand by itself about
+  3 s after the zeros: height -1.7 cm while walking, back to 0 at 18.9 s.
+- **Operator observation:** **one step forward, ~5-8 cm, no noticeable orientation
+  change.** The step itself was at normal walking pace, since a leg cannot be swung
+  slowly without losing balance, and forward progress matched a slow command. So the sign
+  is right (forward is forward) and the magnitude agrees with leg odometry (4.7 cm net,
+  ~7 cm peak). The direction rests on this observation; the CSV logs position only.
+- **Tracking at 0.10 m/s is not characterised.** One step in a 2 s window is too little to
+  measure. Recorded remote walks tracked 0.68-0.81 m/s at 0.8 commanded. Measure this when
+  the waypoint follower exists, with heading and body velocity logged.
+
+**Command path: done for now.** A registered source (`pnc`) is accepted over the remote's
+zero stream. mc starts and stops walking itself, expires stale commands after 1 s, and
+the operator's stick outranks us. The navigation layer has what it needs.
+
 # Mapping and relocalisation with FASTLIO2_ROS2 `pgo` + `localizer` (2026-10-14, source read only)
 
 Plan: freeze our odometry (Point-LIO + DR mode 1) and use only two downstream nodes from
@@ -2381,6 +2481,136 @@ the source, and the load-bearing ones by hand. **Nothing has been built or run y
   This is a re-run from the `_plio` inputs, not a re-recording.
 - Replay runs ~16x real time (1292 poses in 8.0 s). Recording 1 MB clouds at that rate
   needs a deep recorder queue and a check that the cloud count equals the pose count.
+- **`marked_loop_02`, `marked_loop_03` and `live_walk_01` each started on a different taped
+  mark** (operator, 2026-10-14). So none of them can serve as a relocalisation test against
+  another's map. A relocalisation test needs a new walk that starts on the mark of the
+  walk the map was built from.
+
+**Mapping step 1 done (2026-10-14): clouds out of the deterministic harness.**
+- **Cloud recording.** `RECORD_CLOUDS=1 ./tools/run_point_lio_det.sh <bag> <out>` also
+  records `/cloud_registered`, with a deep RELIABLE recorder queue
+  (`tools/record_qos.yaml`). The run fails (exit 6) unless the cloud count equals the pose
+  count. The flag is off by default.
+- **Per-point deskew, verified in source.** Each point of `/cloud_registered` is mapped
+  with the state at its own timestamp: `h_model_output` (`Estimator.cpp:277-279`) for every
+  point, then again after a successful update (`laserMapping.cpp:1229-1233`). The cloud is
+  resized every scan (`:1049`). Odometry and cloud are published once each per scan with
+  the same stamp (`:1396`, `:1409`).
+- **`marked_loop_03` (DR mode 1):** 821 clouds fed, 817 poses and **817 clouds**
+  recorded, 50 MB. The trajectory is **bit-identical** to a run without cloud recording,
+  so recording does not perturb the filter.
+- **Closure of this run:** 0.142 m (0.58 % of 24.6 m), heading +7.05 deg. Leg odometry
+  gives +7.47 deg, so the robot likely did end ~7 deg rotated, within the 4-20 deg
+  repositioning floor. pgo has little to correct here: 14 cm against a ~6 cm repositioning
+  floor.
+
+**Mapping step 2 done (2026-10-14): pgo offline, deterministic.**
+- **Workspace.** `tools/bootstrap_nav_ws.sh` builds `nav_ws/` (gitignored):
+  - FASTLIO2_ROS2's `interface`, `pgo` and `localizer`, copied from the pristine
+    `FASTLIO2_ROS2-main/`, plus `patches/fastlio2_ros2.patch`;
+  - our `nav_src/x2_nav`.
+  It is kept out of slam_ws because slam_ws is also built on the robot, and pgo needs
+  GTSAM (`ros-humble-gtsam` 4.2.0, installed on the laptop 2026-10-14).
+- **The patch (3 changes):**
+  - initialise pgo_node's `last_message_time`;
+  - **isotropic odometry translation noise** (1e-4 on all axes). Upstream's
+    (1e-4, 1e-4, 1e-6) assumes body z is up, and ours is near-horizontal; isotropic is the
+    only choice that does not depend on which body axis points up;
+  - a `cachePairs()` accessor, so loops and their ICP scores can be logged.
+- **`x2_nav/pgo_offline <result_bag> <config> <out_dir>`** replaces pgo_node + bag play.
+  - **Why.** pgo_node's 50 ms wall timer keeps the front of its queue and drops the rest,
+    so results depend on pacing.
+  - **What it does.** It feeds every scan, in stamp order, through the same SimplePGO calls
+    as pgo_node's timerCB. Each `/cloud_registered` scan is first back-projected into the
+    body frame with its same-stamp pose, `p_b = Rᵀ(p_w - t)`.
+  - **Outputs.** `map.pcd`, `keyposes.txt` and `loops.txt`, plus two map-frame trajectory
+    bags (`online` = causal, as pgo_node's TF would give it; `final` = after the last
+    optimisation). Both read with the existing eval tools unchanged.
+  - **Config:** `nav_src/x2_nav/config/pgo_x2.yaml`. `loop_time_tresh` is 20 s (was 60).
+- **Back-projection check.** The mean viewing direction of the body-frame scans is the
+  same at scans 50, 400 and 700 (~[0.3, 0, -0.95], i.e. LiDAR-forward). A wrong transform
+  would rotate it with the robot's heading. Median ranges are 2.9-4.0 m; ~1250 points per
+  scan (0.25 m voxels).
+- **`marked_loop_03` result:**
+  - 817 frames, 63 key poses, **1 loop**: key 62 (57.7 s) -> key 0, ICP fitness 0.046 m².
+  - Final map<-odom correction **5.1 cm, 0.06 deg**. Map: 82,701 points.
+  - **Bit-identical across two runs** (keyposes.txt and map.pcd). Runs in 0.3 s.
+- **Closure (first vs last dwell):**
+
+  | source | closure | z | heading |
+  |---|---|---|---|
+  | Point-LIO + DR | 0.142 m | +0.029 m | +7.05 deg |
+  | pgo `final` | **0.117 m** | -0.016 m | +7.09 deg |
+  | repositioning floor | ~0.06 m | | 4-20 deg |
+
+  **Do not read this as "pgo improves accuracy by 2.5 cm".** The loop constraint is an
+  ICP measurement between the end and start scans, so the post-pgo closure partly
+  measures pgo agreeing with its own constraint. ICP, Point-LIO and leg odometry all keep
+  the ~7 deg end heading, which suggests the robot really did end ~7 deg rotated. Both
+  closures are about 2x the repositioning floor. What this run shows: the loop is
+  *found*, the correction is small and sane, and the map is deterministic. Accuracy
+  needs an independent test (relocalising a *different* walk).
+
+**Mapping step 3 (2026-10-14): offline relocalisation. Works, with one required fix and one open failure.**
+
+`x2_nav/localizer_offline <map.pcd> <result_bag> <config> <out> (--init x,y,z,yaw | --search)`
+- **Tracking** uses FASTLIO2_ROS2's own `ICPLocalizer` (two stages, their thresholds) at the
+  node's 1 Hz cadence: offset = T_map<-odom, guess = offset * T_odom.
+- **`--init`** takes **T_map<-camera_init**, not upstream's T_map<-body. With our body
+  frame pitched ~-85 deg, upstream's convention would start ICP ~86 deg off.
+- **`--search`** grid-searches (x, y, yaw) seeds, registering the walk's first 3 m (in its
+  own camera_init) against the map. It ranks distinct refined solutions by inlier ratio.
+- **Output:** a map-frame trajectory bag, readable by the existing eval tools.
+  Deterministic. `tools/compare_traj.py` scores one trajectory against another by stamp.
+
+**Known-shift self-test.** `marked_loop_03` is localised against its own map moved by
+(3, -2, 0 m, 70 deg). Same data, so this is an optimistic test of the machinery, not of
+accuracy.
+- The search recovers the shift to 1 cm / 0.2 deg.
+- **Upstream 6-DOF ICP failed it:** in the last 25 s it settled on a solution **tilted
+  3.7 deg and 14 cm high** (closure tilt 3.68 deg against odometry's 0.76 deg, level floor).
+  It still passed the fitness gates easily (refine 0.005 m² against a 0.1 gate).
+- **Fix (in the patch):** `yaw_estimation.h`, a closed-form 4-DOF (x, y, z, yaw)
+  point-to-point estimator plugged into both ICP stages (`yaw_only: true`). It is
+  justified because the map and camera_init are both gravity-aligned and odometry tilt
+  drift is < 1 deg.
+- **Errors after the fix** (p95, vs the shifted pgo trajectory): horizontal 0.114 ->
+  **0.082 m**, vertical 0.165 -> **0.044 m**, rotation 3.07 -> **0.61 deg**. Runner-up
+  margin 97 % vs 75 % inliers.
+
+**Cross-walk** (different walks, same office, different tape marks; map = `marked_loop_03`
+pgo map). The truth available is each walk's own return to its mark:
+
+| walk | odometry-only closure | via the map | fit to the map |
+|---|---|---|---|
+| `live_walk_01` (offset-0 replay is a SLIPPED draw: tilt 9 deg, z +0.6 m) | 0.540 m horiz, +11.95 deg | **0.112 m, +2.30 deg** | 0.013 m², 125/125 accepted |
+| `marked_loop_02` | 0.083 m, +6.29 deg | **0.159 m, +12.27 deg (worse)** | 0.054 m² (RMS 0.23 m), 66/76, failures at 35-40 s |
+
+- **`live_walk_01`: credible.**
+  - Tracking ends at the *identical* offset (x -1.669, y -0.569, yaw -10.16 deg) from two
+    different initial guesses (3 m search, and whole-walk search).
+  - The offset's ~10 deg yaw change over the walk matches the odometry's heading drift
+    (+11.95 deg).
+  - The localizer corrects the horizontal and heading drift of a bad odometry draw. It
+    cannot fix tilt or z, by design (4-DOF).
+- **`marked_loop_02`: not reliably localisable on this map.**
+  - The 3 m search is a coin flip: 59.2 % (yaw 17 deg, z 0) vs 59.1 % (yaw -85 deg,
+    **z +0.52 m**).
+  - The whole-walk search picks the second, but a 0.5 m height offset is physically
+    impossible on one level floor. Neither hypothesis fits well.
+  - Suspected cause, NOT verified: map coverage. The E1R sees only 123 deg forward, so a
+    loop walked in a different direction sees different walls. The map holds only the
+    surfaces `marked_loop_03` faced.
+
+**What this means for navigation:**
+- The localizer can hold a pose against a map and correct odometry drift (`live_walk_01`).
+- **The map must be recorded so that it covers the directions the robot will travel.**
+  Single-direction loops are not enough with a forward-only LiDAR.
+- A height prior (same floor => z offset ~ 0) would have rejected the implausible
+  hypothesis. Not implemented yet.
+
+**Navigation acceptance target** (operator, 2026-10-14): the robot ends inside a
+**1 m x 1 m area** at each waypoint.
 
 # What to record next
 
