@@ -2040,6 +2040,230 @@ The robot has a separate, paywalled localization subsystem (`/loc_tele/current_p
 `/loc_tele/relocalization_result`, `/heartbeat/loc_state/...LocStatusHeartBeat`); filling
 the `/slam/*` slot does not activate it, and this run should not be read as doing so.
 
+# Live walk, and the run-to-run sensitivity it exposed (2026-10-13)
+
+`live_walk_01`: 124.5 s, 30.3 m, 1246 clouds -> **1246 live poses, zero loss over DDS**.
+Live closure **0.077 m, yaw -2.22 deg**; leg odometry **1.676 m** on the same walk.
+
+The offline replay of the *identical inputs* gave **0.812 m, +25.37 deg**. Chasing that gap
+refuted four hypotheses by measurement: message ordering (stamp-sorted replay: 0.812 m
+again), OpenMP non-associativity (5 runs, 1 and 8 threads: bit-identical), cloud layout
+(matches the hardcoded offsets exactly), and the in-process bag reader (a DDS replay gave
+1.050 m, no better). Code and config are byte-identical on robot and PC (md5).
+
+**What explained it: the filter is highly sensitive to the replay start.** Same bag, same
+code, only the first N seconds of stationary data trimmed:
+
+| trim | DR on | DR off |
+|---|---|---|
+| 0 s (untrimmed) | 0.812 m / +25 deg | not run |
+| 3 s | 0.065 m / -0.3 deg | 5.322 m / +59 deg |
+| 6 s | 1.246 m / +47 deg | 10.894 m / -2 deg |
+| 9 s | 0.083 m / +0.4 deg | 3.700 m / +57 deg |
+| 12 s | 0.876 m / +63 deg | 2.710 m / +25 deg |
+| 15 s | 0.921 m / +59 deg | 1.409 m / +26 deg |
+
+DR-on closure ranges **0.065 to 1.246 m**; the live 0.077 m is one sample inside that
+range. **"Live beats offline 10x" is wrong** -- there is no live/offline gap, there is a
+wide distribution and live landed at its good end.
+
+### First heading ground truth
+
+Operator report for `live_walk_01`, measured against the 1 m edge: the robot ended
+**~8 deg to the right** (right foot closer to the edge, left foot drifted away), i.e.
+rotated clockwise, **about -8 deg** in ROS's CCW-positive convention. Position: ~5 cm
+north-west of the mark after one corrective step back.
+
+**CORRECTED 2026-10-13 -- the yaw figures originally here were wrong.** They came from
+the ZYX yaw of each orientation, but the IMU frame on this robot sits at pitch -84..-88
+deg, next to the ZYX singularity, so that "yaw" mixes in roll. Heading must be taken from
+the world-frame delta rotation between the two dwells (`rel_rot()` in
+`tools/eval_loop_closure.py`):
+
+| source | old (wrong) yaw | heading, world-delta | vs operator's ~-8 deg |
+|---|---|---|---|
+| live Point-LIO | -2.22 deg | **+0.96 deg** | disagrees by ~9 deg |
+| leg odometry | -3.77 deg | **+1.48 deg** | disagrees by ~9.5 deg |
+
+Two largely independent estimators now agree with each other (~+1 deg) and both disagree
+with the floor measurement. Unresolved. One plausible reason: the edge was judged against
+the *feet*, and a humanoid's feet can sit rotated relative to its torso after a corrective
+step, so foot heading need not equal body heading. The sign convention of "8 deg to the
+right" is a second possible source. Not settled until a heading reference is taken off the
+torso rather than the feet.
+
+### What this changes
+
+- **DR helps, consistently.** DR-on beat DR-off in 5 of 5 pairs, by 1.5x to 87x. The
+  direction of the conclusion survives.
+- **The magnitudes do not.** Every closure figure quoted earlier (`marked_loop_03`
+  1.524 -> 0.142 m, "91 %", "0.35 % of path"; `marked_loop_02` 0.077 vs 0.088 m) is a
+  **single sample** from a distribution this wide. Treat them as "one draw", not as the
+  expected error. `marked_loop_02`'s DR-vs-baseline null result is likewise one draw.
+- **The failure that remains is yaw.** The bad DR-on runs end at +47 to +63 deg. DR
+  observes velocity only; nothing constrains heading, which is why velocity runaway is
+  fixed but yaw still wanders.
+- **Cause not proven.** The live run started SLAM ~20 s before the recorder, so its filter
+  had initialised and settled before the bag begins; offline always starts cold. That fits,
+  but we only measured *sensitivity to start offset*, not that pre-roll is the cause.
+
+Also fixed: `run_point_lio.sh` played every topic, so bags containing live
+`/aft_mapped_to_init` would have republished old poses into the recording. Now whitelists
+the three inputs.
+
+# The start-offset ensemble, audited (2026-10-13)
+
+`tools/offset_sweep.py` replays a bag 11 times with 0..15 s trimmed off the start, DR on
+and off, and scores every run. Before trusting it, it was independently audited (four
+reviewers, every finding attacked by two skeptics: 19 raised, 13 survived both). The
+findings that changed conclusions, each re-verified against the data:
+
+1. **Every yaw number was wrong** (gimbal lock, above). The "remaining failure is yaw"
+   conclusion was wrong too: the bad runs carry **8-12 deg of tilt** error (world-up has
+   moved), with heading error ~10 deg alongside.
+2. **Closure is bimodal.** A run either re-registers to the start map or slips; reporting a
+   median/min/max band misdescribes it. Now reported as slip rate + good-mode median.
+3. **Closure hid a height problem.** Closure scores endpoints only. Mid-walk height on a
+   flat floor (`dz`, see below) is *worse* with DR on in 8/11 runs on both hard loops.
+4. **Crashes were invisible.** The harness exited with the status of its last pipeline,
+   not the node's. Now it exits with the node's status, and the sweep rejects any run that
+   did not feed every cloud -- which immediately caught **4 segfaults, all DR off**, on the
+   corridor. Before, they would have been scored on truncated trajectories.
+5. **Metrics that are not error measures were being tallied.** Peak speed (real chest motion
+   reaches ~0.84 m/s) and leg-odometry agreement (anti-correlated with truth on loops) are
+   now descriptive only.
+
+## The harness was not deterministic under load -- now it is
+
+Three identical replays run concurrently produced **two different trajectories** (diverging
+86 s in, 3.6 cm max, 5 mm in closure). Cause: ikd-Tree rebuilds subtrees of >= 1500 points
+on a **background thread**, so map contents at query time depended on CPU scheduling. Every
+earlier "bit-identical" check had run on an idle machine. Fixed in the patch: in replay mode
+the threshold is set to INT_MAX so every rebuild is synchronous (live keeps upstream's 1500
+-- large rebuilds must not stall the filter). Second impurity: the recorder dropped a
+variable 0.3-2.2 s of leading poses (it must discover the publisher; the topic is
+VOLATILE). Fixed: replay now waits for its subscriber before feeding. Verified: **six
+concurrent replays, identical pose counts, identical closure to every digit, zero differing
+poses across 15 pairwise comparisons.**
+
+The thread noise never flipped a run between modes (max 5 mm across 66 pairs), so the
+start-offset sensitivity is real, ~250x larger than the noise.
+
+## What the ensemble says about DR (11 offsets x 5 bags, deterministic build)
+
+| bag | slips DR on / off | good-mode closure on / off | mid-walk dz mean on / off | DR-off peak speed |
+|---|---|---|---|---|
+| `live_walk_01` | **5/11 vs 10/11** | 0.077 / 0.072 m | 0.212 / 0.148 m | 3.5 m/s |
+| `marked_loop_03` | **0/11 vs 7/11** | 0.131 / 0.132 m | 0.144 / 0.096 m | 2.6 m/s |
+| `marked_loop_02` | 0/11 vs 0/11 | 0.088 / 0.080 m | 0.030 / 0.048 m | 1.2 m/s |
+| `office_corridor_02` | -- (no truth) | -- | 0.747 / **100.8 m** | **735 m/s** |
+| `walk_20261007_102515` | -- (no truth) | -- | 0.029 / 0.070 m | 11.0 m/s |
+
+DR-on peak speed is 0.87-1.04 m/s on every bag. Re-running all 66 loop-bag runs on the
+deterministic build changed no run's mode (max closure change 21.8 mm), so the threaded-build
+numbers quoted earlier stand.
+
+**Corrected: the corridor "crashes" were not a DR-off property.** On the threaded build, 4/11
+DR-off corridor runs segfaulted; on the deterministic build all 11 complete. The segfaults
+came from ikd-Tree's background rebuild thread acting on a filter that had diverged to
+kilometre-scale coordinates. **This is a live risk**: the robot runs the threaded build
+(rebuilds must not stall the filter), so a diverging filter there can crash the node. DR
+prevents the divergence, which is what protects against it -- but the claim "DR prevents
+crashes" named the wrong mechanism.
+
+**DR is a robustness fix, not an accuracy fix.** When neither mode slips, closure is the same
+(0.077 vs 0.072, 0.131 vs 0.132, 0.088 vs 0.080 m). What DR changes is how often things go
+wrong: slips, divergence (corridor peak speed 1.0 vs 649 m/s) and crashes. Earlier claims of
+"91 % better" compared a slipped baseline draw with an unslipped DR draw.
+
+**And it costs height on hard walks.** On both hard loops DR-on holds height worse mid-walk
+(8/11 each); on the two easy walks it holds it better (10/11, 11/11).
+
+## Why DR costs height: hypothesis, NOT confirmed
+
+Hypothesis: the residual is `R * v_legodom - v_state`. It depends on the attitude `R`, but the
+update puts the Jacobian only on the velocity block -- it treats `R * v_legodom` as a fixed
+measurement. With a tilt error, walking velocity would project into false vertical velocity
+that the filter integrates, and nothing would let DR correct the tilt.
+
+**The observational evidence does not separate it.** `tools/dr_vertical_check.py` on
+`live_walk_01` (deterministic build, 6 offsets each):
+
+| | corr(filter v_z, (R_est * v_leg)_z) | integral of that term over the walk |
+|---|---|---|
+| DR on | +0.78 .. +0.90 | -0.49 .. -1.22 m |
+| DR off | +0.60 .. +0.77 | -0.57 .. -1.35 m |
+
+The DR-off control shows nearly the same signature, so the +0.81 correlation first cited as
+evidence is not specific to DR: gait bob is present in both v_z and leg odometry's body
+velocity, and any tilt error scales both together. That claim was made before running the
+control and was over-read. The height cost of DR on hard walks is measured (8/11 worse on
+both hard loops); its cause is **unexplained**. Settle it by intervention, not correlation:
+
+Candidate fixes, to be judged by a full ensemble, not one run: (a) put the attitude
+Jacobian `-[R v]x` into the DR update so DR can correct tilt; (b) apply DR to horizontal
+velocity only, never pushing v_z.
+
+# Intervention: why does DR cost height? (2026-10-13)
+
+Two experimental DR modes, alongside the unchanged baselines (0 = off, 1 = current DR):
+
+| mode | residual | what it tests |
+|---|---|---|
+| 3 | mode 1 without its direct world-z row | is the height cost carried by DR's z row? |
+| 4 | body frame `v_leg - R^T v`, **with** attitude Jacobian `H_rot = [R^T v]x`, `H_vel = R^T` | is the height cost the missing attitude Jacobian? |
+
+Caveat on mode 3 (from review): the x/y rows still move v_z, pos_z and attitude through the
+filter's cross-covariances, so mode 3 removes only DR's *direct* vertical channel. A null
+result under mode 3 would not clear the z channel.
+
+Verified before spending the compute:
+- **Mode 4's Jacobian** was derived independently twice from the code's own conventions
+  (IKFoM right perturbation `R <- R Exp(dtheta)`, residual `z = y - h(x)`, `H = dh/ddx`,
+  rot at tangent cols 3..5, vel at 12..14) and checked by central finite differences:
+  error 1e-8 with clean second-order convergence; the sign-flipped Jacobian fails (so the
+  test has power). One filter step shrinks the residual 290x with the code's sign.
+- **Modes 0 and 1 are bit-identical** on the new build (pose counts and every pose), so the
+  existing deterministic sweep is a valid baseline and only modes 3/4 needed running.
+- **Guards**: an unsupported `dr_mode` now exits with an error (it used to log "[dr] mode N"
+  and silently do nothing); the node logs `[dr] updates applied: N`, and the sweep rejects
+  any DR-on run that applied none.
+
+Risks to watch in mode 4 (review, not bugs): its Jacobian lets a leg-odometry direction
+bias or slip rotate attitude, including yaw, at full gain; there is no innovation gate;
+and if leg odometry reports pelvis velocity rather than chest-IMU velocity, the missing
+`omega x r` lever-arm term would be absorbed into attitude.
+
+## Result: neither intervention removes the height cost
+
+Ensemble, 5 bags x 11 start offsets, modes 3 and 4 against the unchanged baselines
+(`tools/sweep_report.py`, merged files):
+
+| bag | median mid-walk dz: off / DR1 / DR3 / DR4 | slips: off / DR1 / DR3 / DR4 |
+|---|---|---|
+| `live_walk_01` | 0.148 / 0.212 / 0.284 / 0.189 m | 10 / 5 / 7 / 5 of 11 |
+| `marked_loop_03` | 0.096 / 0.144 / 0.152 / 0.140 m | 7 / 0 / 0 / 0 of 11 |
+| `marked_loop_02` | 0.048 / 0.030 / 0.053 / 0.033 m | 0 / 0 / 0 / 0 of 11 |
+| `walk_20261007_102515` | 0.070 / 0.029 / 0.045 / 0.033 m | (no truth) |
+| `office_corridor_02` | 100.8 / 0.747 / 1.088 / 0.995 m | (no truth) |
+
+- **Mode 3 is worse.** Median dz is higher than DR1 on 5/5 bags; better in only 16/55 paired
+  runs. It also weakens robustness (7/11 slips on `live_walk_01`; peak speed up to 2.8 m/s).
+  DR's direct vertical row was *helping* height, not causing the cost.
+- **Mode 4 is indistinguishable from DR1.** Better on dz in 26/55 paired runs, lower median dz
+  on 2/5 bags, identical slip rates, marginally lower tilt (0.42 vs 0.78 deg, 0.45 vs 0.50 deg
+  on the hard loops). The added complexity and its yaw-coupling risk buy nothing measurable.
+- **Conclusion: the missing-attitude-Jacobian hypothesis is not supported.** Mode 1 stays the
+  default; modes 3 and 4 stay in the code as documented negative results.
+
+### Assumption not yet checked: is the route level?
+
+`dz` treats any height change while walking as error, which is only true on a level route.
+DR *off* also shows 0.10-0.15 m mean and ~0.4-0.5 m peak dz on the hard loops, which is a lot
+of error for a chest that should bob a few centimetres. Leg odometry cannot arbitrate: its
+z is identically ~0 (it does not model height). If the hard loops include a ramp, threshold
+or sloped section, part of "the height cost" is real terrain and the metric is wrong there.
+
 # What to record next
 
 The limitation is **geometry, not duration**. More minutes in the same room gives the

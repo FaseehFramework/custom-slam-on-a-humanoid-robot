@@ -21,7 +21,12 @@ tools/eval_loop_closure.py  drift vs a physically marked start/end (real ground 
 tools/live_slam.sh          start/stop/status live SLAM on the robot
 RUNBOOK_live_walk.md        step-by-step live walking run (hand to the operator)
 tools/dr_payoff.py          bounds what a leg-odometry DR factor would recover
-patches/point_lio_ros2.patch  our changes to upstream (pcl_ros, QoS, rx counter, bag_path)
+tools/offset_sweep.py       start-offset ensemble (DR on/off) -- use before any claim
+tools/sweep_report.py       cross-bag table; merges baseline + --tag experiment JSONs per bag
+tools/dr_vertical_check.py  does DR leak horizontal velocity into v_z (corr is NOT specific;
+                            compare against DR off)
+patches/point_lio_ros2.patch  our changes to upstream (pcl_ros, QoS, rx counter, bag_path,
+                            DR factor, publish_tf gate, deterministic replay)
 slam_ws/src/x2_cloud_adapter/  OURS: cloud adapter + slam_publisher + config + launch
 slam_ws/src/point_lio_ros2/    third party, gitignored, reproducible
 data/bags/, results/           gitignored, NOT reproducible without the robot
@@ -58,6 +63,9 @@ X2_HOST=soc1ap ./record_walk.sh --fetch       # stop, verify, copy here, delete 
 ./tools/analyze_bag.py data/bags/<bag>
 ./tools/dr_payoff.py results/<outname> data/bags/<bag>   # DR payoff bound
 ./tools/eval_loop_closure.py results/<outname> data/bags/<bag>  # needs a marked walk
+./tools/offset_sweep.py data/bags/<bag> [--loop] --dr 1,0          # baseline ensemble
+./tools/offset_sweep.py data/bags/<bag> [--loop] --dr 3,4 --tag x  # experiment, own JSON
+./tools/sweep_report.py                                           # merged table
 
 # --- on the robot ---------------------------------------------------------
 ssh soc1
@@ -128,17 +136,15 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
 
 ## State / next step
 
-Working: deterministic harness (bit-identical runs), recording incl. detached AP mode,
+Working: deterministic harness (bit-identical, verified under 6-way concurrency since
+2026-10-13), recording incl. detached AP mode,
 cloud adapter, extrinsics confirmed three ways.
 
-**Working (2026-10-12): the leg-odometry DR factor.** Validated against **physical
-ground truth** on `marked_loop_03` (24.6 m marked loop): closure error **1.524 m -> 0.142 m**
-raw, **1.560 m -> 0.085 m** after correcting for a measured 6 cm repositioning offset
-(**0.35 % of path**), and yaw **40.11 -> 2.71 deg**. It beats leg
-odometry itself (0.292 m / -7.30 deg), which proves fusion rather than passthrough --
-a passthrough cannot beat its own source. On `office_corridor_02` (leg-odometry-scored):
-13.75 m -> 0.79 m, path inflation 1.34x -> 1.00x, peak speed 5.395 -> 0.971 m/s.
-Deterministic, and inert when off (`dr_mode:=0` reproduces the old baseline exactly).
+**The leg-odometry DR factor** (`dr_mode: 1`): a robustness fix -- see "Closure numbers are
+single draws" below for what it does and does not do. The 2026-10-12 headline figures
+(1.524 -> 0.142 m, "91 %", "0.35 % of path", yaw 40 -> 2.7 deg) were single draws comparing a
+slipped baseline run with an unslipped DR run, and the yaw part was a gimbal-lock artefact.
+Do not quote them.
 
 How it works: velocity is state index 12..14 of the 30-state output filter, so the
 residual `z = R*v_legodom - v_state` has an identity H and the gain is a slice of P --
@@ -172,6 +178,37 @@ Next, in order:
    (publisher count back to 0, no strays), vendor stack unaffected. **Still unknown:**
    whether `soc0_task_manager` reacts -- no before/during/after instrumentation was taken.
    Filling this slot does NOT enable the paywalled nav stack (`/loc_tele/*`).
+
+## Closure numbers are single draws -- never quote one as "the error"
+
+Run `tools/offset_sweep.py data/bags/<bag> [--loop]` (11 start offsets, DR on/off) and
+`tools/sweep_report.py`; compare distributions, never single runs. Closure is **bimodal**
+(re-registers or slips) -- report slip rate + good-mode median. Offsets are correlated:
+bags, not offsets, are the unit of generalisation.
+
+What the ensemble established: **DR is a robustness fix, not an accuracy fix.** Unslipped
+closure is the same with and without it; DR cuts slips (10/11 -> 5/11, 7/11 -> 0/11) and
+divergence (corridor DR-off: 100 m height error, 735 m/s). A diverged filter can SEGFAULT
+in ikd-Tree's background rebuild thread -- the threaded (live) build only; DR prevents it by
+preventing the divergence. It **costs mid-walk height** on hard walks (8/11
+worse). Cause UNEXPLAINED. Tested by intervention under the full ensemble and refuted:
+`dr_mode 3` (no direct z row) is worse on 5/5 bags; `dr_mode 4` (body-frame residual WITH
+attitude Jacobian, numerically verified) is a coin flip vs mode 1 (26/55). Keep mode 1.
+Do not re-try either. First confirm the routes are level -- `dz` assumes a flat floor, and
+DR off also shows 0.1-0.15 m mean dz on the hard loops.
+
+**DO NOT** read single-orientation yaw on this robot: the IMU frame sits at pitch ~-85 deg
+(gimbal lock). Use `rel_rot()` (world-frame delta) in `tools/eval_loop_closure.py`. Every
+yaw figure before 2026-10-13 was wrong.
+
+**DO NOT** trust end-point-only metrics. Closure hid the height problem; check `dz` (height
+error while walking) too.
+
+The harness is deterministic **only since 2026-10-13**: ikd-Tree's background rebuild
+thread made replays depend on CPU load (fixed: synchronous rebuild in replay mode), and the
+recorder dropped leading poses (fixed: replay waits for its subscriber). Verified with six
+concurrent identical replays. The harness now exits with the node's status; a crash is a
+failure, never a scored row.
 
 ## No vendor buffer records a PointCloud2
 
