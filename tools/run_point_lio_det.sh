@@ -33,7 +33,14 @@ rm -rf "$OUT"; mkdir -p "${ROOT}/results"
 LOG="${ROOT}/results/${OUTNAME}.log"
 
 echo "==> recording output"
-ros2 bag record -o "$OUT" /aft_mapped_to_init > /dev/null 2>&1 &
+# RECORD_CLOUDS=1 also records /cloud_registered (deskewed, world frame, 0.25 m voxels) for
+# the pgo/localizer pipeline. Off by default: default runs stay exactly as before.
+if [[ "${RECORD_CLOUDS:-0}" == "1" ]]; then
+  ros2 bag record -o "$OUT" --qos-profile-overrides-path "${ROOT}/tools/record_qos.yaml" \
+    /aft_mapped_to_init /cloud_registered > /dev/null 2>&1 &
+else
+  ros2 bag record -o "$OUT" /aft_mapped_to_init > /dev/null 2>&1 &
+fi
 REC_PID=$!
 trap 'kill -INT ${REC_PID:-0} 2>/dev/null; kill ${NODE_PID:-0} 2>/dev/null' INT TERM
 sleep 3
@@ -68,6 +75,15 @@ echo "==> errors"
 grep -Ei "error|fail|segmentation|terminate" "$LOG" | head -4 || echo "  (none)"
 echo "==> result (node exit ${NODE_RC})"
 ros2 bag info "$OUT" 2>/dev/null | grep -E "Duration|Count:" | sed 's/^/  /'
+
+if [[ "${RECORD_CLOUDS:-0}" == "1" ]]; then
+  NP=$(ros2 bag info "$OUT" 2>/dev/null | grep -E "Topic: /aft_mapped_to_init " | grep -oE "Count: [0-9]+" | grep -oE "[0-9]+")
+  NC=$(ros2 bag info "$OUT" 2>/dev/null | grep -E "Topic: /cloud_registered " | grep -oE "Count: [0-9]+" | grep -oE "[0-9]+")
+  if [[ -z "$NP" || -z "$NC" || "$NP" != "$NC" ]]; then
+    echo "  FAILED: cloud count (${NC:-none}) != pose count (${NP:-none}) -- clouds were lost" >&2; exit 6
+  fi
+  echo "  clouds == poses ($NC)"
+fi
 
 # Exit status must reflect the NODE, not the last pipeline above (which is 0 whenever an
 # output bag exists). A crash or truncated replay has to be visible to callers such as
