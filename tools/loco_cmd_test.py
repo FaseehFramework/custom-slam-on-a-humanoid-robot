@@ -2,15 +2,36 @@
 """FIRST MOTION TEST: does publishing /aima/mc/locomotion/velocity make the X2 walk?
 
 This is the only tool in the project that can make the robot MOVE. It runs ON soc1.
+How mc works (read from its own log + config on soc0, 2026-10-14):
+  - There is no walk-mode toggle. A standing robot (STAND_DEFAULT) is switched by mc
+    ITSELF to LOCOMOTION_DEFAULT when it accepts a motion command ("Current state is stable,
+    will auto set moving action"), and back to STAND_DEFAULT ~3-4 s after the command ends.
+  - mc only accepts commands whose `source` is a registered, enabled input source
+    (mc_param/.../mc.yaml `input_sources`): rc 80, vr 70, app_proxy 60, interaction 50,
+    pnc 40 -- all timeout 1000 ms. Anything else is dropped ("Input Source is not enabled,
+    will drop this input directly!!!" -- that is what happened to source 'x2slam_test').
+  - We use `pnc` (planning-and-control: the vendor's slot for navigation). Its priority is
+    BELOW the remote's, so the operator's stick wins.
+  - Each source's command expires after its timeout (1000 ms), logged as "has been expired,
+    clear command": mc's own command watchdog. The live test verifies it with leg odometry.
+
 Every safety rule is enforced in code, not left to the procedure:
 
-  INTERLOCK   refuses to publish unless GetMcAction reports action_desc ==
-              'LOCOMOTION_DEFAULT' and status RUNNING. Uses the DESCRIPTION, because the
+  INTERLOCK   refuses to publish unless GetMcAction reports action_desc STAND_DEFAULT or
+              LOCOMOTION_DEFAULT with status RUNNING. Uses the DESCRIPTION, because the
               numeric field reads 0 even when the description is set (measured 2026-10-14).
-              Our code NEVER changes the motion mode -- the operator does, with the remote.
+              Our code NEVER calls SetMcAction -- mc's own auto-switch and the operator's
+              remote are the only things that change the mode.
   HARD CAPS   |forward| <= 0.20 m/s, lateral = angular = 0, duration <= 3.0 s.
-  ABORT       re-checks the mode at 5 Hz while publishing; any change (remote e-stop,
-              mode switch, service failure) stops publishing at once.
+  START WAIT  the command is what makes mc switch STAND -> LOCOMOTION, and that switch can
+              be held up for seconds (live test 1: a head-touch animation blocked it 2.6 s,
+              longer than the whole 2 s window). So the command is published while waiting
+              for LOCOMOTION_DEFAULT + RUNNING (at most --max-start-wait <= 3.0 s, else
+              zeros + abort), and the --duration window only starts once walking has begun.
+              Walking time stays <= --duration.
+  ABORT       re-checks the mode at 5 Hz while publishing; anything other than
+              STAND/LOCOMOTION_DEFAULT in RUNNING or TRANSITION (remote e-stop, damping,
+              passive, service failure) stops publishing at once.
   STOP        always ends with 1.0 s of explicit zero commands, including on Ctrl-C or
               any exception, then destroys the publisher.
   NO LATCH    BEST_EFFORT + VOLATILE, matching the mc subscriber; a TRANSIENT_LOCAL
@@ -33,15 +54,17 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from aimdk_msgs.msg import McLocomotionVelocity
-from aimdk_msgs.srv import GetMcAction
+from aimdk_msgs.srv import GetMcAction, GetCurrentInputSource
 from nav_msgs.msg import Odometry
 
 TOPIC = '/aima/mc/locomotion/velocity'
 ACTION_SRV = '/aimdk_5Fmsgs/srv/GetMcAction'
-REQUIRED_ACTION = 'LOCOMOTION_DEFAULT'
-RUNNING = 100
+START_ACTIONS = ('STAND_DEFAULT', 'LOCOMOTION_DEFAULT')   # mc auto-switches STAND -> LOCOMOTION
+RUNNING, TRANSITION = 100, 200
+INPUT_SRC_SRV = '/aimdk_5Fmsgs/srv/GetCurrentInputSource'
 MAX_FWD, MAX_DUR, RATE_HZ, ZERO_TAIL_S, WATCH_AFTER_S = 0.20, 3.0, 50.0, 1.0, 4.0
-SOURCE = 'x2slam_test'   # our own tag: also tests whether mc filters by source
+MAX_START_WAIT = 3.0
+SOURCE = 'pnc'           # registered planning-and-control source, priority 40 < rc 80
 
 
 class Tester(Node):
@@ -52,6 +75,7 @@ class Tester(Node):
                          durability=DurabilityPolicy.VOLATILE)
         self.pub = self.create_publisher(McLocomotionVelocity, TOPIC, qos)
         self.cli = self.create_client(GetMcAction, ACTION_SRV)
+        self.src_cli = self.create_client(GetCurrentInputSource, INPUT_SRC_SRV)
         self.create_subscription(McLocomotionVelocity, TOPIC, self.on_cmd, qos)
         self.create_subscription(Odometry, '/aima/mc/leg_odometry', self.on_leg, qos)
         self.lock = threading.Lock()
@@ -72,19 +96,31 @@ class Tester(Node):
             self.last_leg = (time.time(), p.x, p.y, p.z)
             self.w.writerow([f'{time.time():.4f}', 'leg', '', '', '', '', p.x, p.y, p.z])
 
-    def action(self):
-        """(ok, description) -- ok only for LOCOMOTION_DEFAULT + RUNNING."""
-        if not self.cli.service_is_ready() and not self.cli.wait_for_service(timeout_sec=3.0):
-            return False, 'action service unavailable'
-        fut = self.cli.call_async(GetMcAction.Request())
+    def _call(self, cli, req):
+        if not cli.service_is_ready() and not cli.wait_for_service(timeout_sec=3.0):
+            return None
+        fut = cli.call_async(req)
         t_end = time.time() + 2.0
         while not fut.done() and time.time() < t_end:
             time.sleep(0.01)
-        r = fut.result() if fut.done() else None
+        return fut.result() if fut.done() else None
+
+    def action(self, allowed_status=(RUNNING,)):
+        """(ok, description): ok only for STAND/LOCOMOTION_DEFAULT in an allowed status."""
+        r = self._call(self.cli, GetMcAction.Request())
         if r is None:
-            return False, 'no response from action service'
+            return False, 'action service unavailable or no response'
         desc, st = r.info.action_desc, r.info.status.value
-        return (desc == REQUIRED_ACTION and st == RUNNING), f'{desc} status={st}'
+        with self.lock:
+            self.w.writerow([f'{time.time():.4f}', 'mode', desc, st, '', '', '', '', ''])
+        return (desc in START_ACTIONS and st in allowed_status), f'{desc} status={st}'
+
+    def input_source(self):
+        r = self._call(self.src_cli, GetCurrentInputSource.Request())
+        if r is None:
+            return 'unavailable'
+        i = r.input_source
+        return f'{i.name} (priority {i.priority}, timeout {i.timeout} ms)'
 
     def send(self, fwd):
         m = McLocomotionVelocity()
@@ -103,6 +139,10 @@ class Tester(Node):
             self.w.writerow([f'{time.time():.4f}', 'sent', SOURCE, fwd, 0.0, 0.0, '', '', ''])
 
 
+class _Abort(Exception):
+    pass
+
+
 def horiz_speed(samples):
     if len(samples) < 2:
         return None
@@ -114,6 +154,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--forward', type=float, default=0.10)
     ap.add_argument('--duration', type=float, default=2.0)
+    ap.add_argument('--max-start-wait', type=float, default=3.0,
+                    help='max seconds to wait for mc to switch to LOCOMOTION_DEFAULT')
     ap.add_argument('--dry-run', action='store_true',
                     help='run every check and the logging, but publish only zeros')
     ap.add_argument('--log', default=os.path.expanduser('~/slam_ws/loco_test.csv'))
@@ -122,6 +164,8 @@ def main():
         sys.exit(f'--forward must be within 0..{MAX_FWD} m/s (hard cap)')
     if not (0.0 < a.duration <= MAX_DUR):
         sys.exit(f'--duration must be within 0..{MAX_DUR} s (hard cap)')
+    if not (0.0 < a.max_start_wait <= MAX_START_WAIT):
+        sys.exit(f'--max-start-wait must be within 0..{MAX_START_WAIT} s (hard cap)')
     fwd = 0.0 if a.dry_run else a.forward
 
     rclpy.init()
@@ -158,9 +202,10 @@ def run(n, a, fwd):
     ok, desc = n.action()
     print(f'[interlock] motion mode: {desc}')
     if not ok:
-        print(f'[interlock] REFUSING: need {REQUIRED_ACTION} + RUNNING. Nothing was published. '
-              f'Put the robot in walk mode with the remote first.')
+        print(f'[interlock] REFUSING: need {" or ".join(START_ACTIONS)} + RUNNING. '
+              f'Nothing was published. Stand the robot up with the remote first.')
         return 3
+    print(f'[arbitration] mc current input source before: {n.input_source()}  (we publish as "{SOURCE}")')
     time.sleep(1.0)                           # baseline: let leg odometry and cmd logging settle
     with n.lock:
         base = n.last_leg
@@ -175,10 +220,37 @@ def run(n, a, fwd):
         print(f'[test] publishing forward={fwd:.2f} m/s for {a.duration:.1f} s '
               f'({"DRY RUN: zeros only" if a.dry_run else "LIVE"}); Ctrl-C aborts to zeros')
         entered['loop'] = True
+        src_mid = None
+        # ---- start phase: publish until mc reports walking (skipped in a dry run: zeros
+        # never trigger the switch) -----------------------------------------------------
+        if not a.dry_run:
+            ts = time.time(); next_check = ts; walking = False
+            while time.time() - ts < a.max_start_wait and not stopping['flag']:
+                if time.time() >= next_check:
+                    r = n._call(n.cli, GetMcAction.Request())
+                    desc, st = (r.info.action_desc, r.info.status.value) if r else (None, None)
+                    with n.lock:
+                        n.w.writerow([f'{time.time():.4f}', 'mode', desc, st, '', '', '', '', ''])
+                    if desc == 'LOCOMOTION_DEFAULT' and st == RUNNING:
+                        walking = True
+                        break
+                    if desc not in START_ACTIONS or st not in (RUNNING, TRANSITION):
+                        print(f'[abort] motion mode changed to: {desc} status={st}')
+                        break
+                    next_check = time.time() + 0.2
+                n.send(fwd)
+                time.sleep(period)
+            t_start_wait = time.time() - ts
+            print(f'[start] mc walking after {t_start_wait:.2f} s' if walking else
+                  f'[abort] mc did not switch to LOCOMOTION_DEFAULT within {t_start_wait:.2f} s')
+            if not walking:
+                raise _Abort()
         t0 = time.time(); next_check = t0
         while time.time() - t0 < a.duration and not stopping['flag']:
+            if src_mid is None and time.time() - t0 >= a.duration / 2:
+                src_mid = n.input_source()
             if time.time() >= next_check:
-                ok, desc = n.action()
+                ok, desc = n.action(allowed_status=(RUNNING, TRANSITION))
                 if not ok:
                     print(f'[abort] motion mode changed to: {desc}')
                     break
@@ -189,11 +261,16 @@ def run(n, a, fwd):
             time.sleep(period)
         else:
             verdict = 'COMPLETED' if not stopping['flag'] else 'ABORTED (Ctrl-C)'
+    except _Abort:
+        verdict = 'ABORTED (no walking within start wait)'
     finally:
         if entered['loop']:
             zeros(ZERO_TAIL_S)                # explicit stop, whatever happened above
             print('[stop] sent zeros')
         n.destroy_publisher(n.pub)
+    if entered['loop']:
+        print(f'[arbitration] mc current input source mid-command: {src_mid}')
+        print(f'[arbitration] mc current input source after zeros: {n.input_source()}')
 
     # ---- did it stop? watch leg odometry after our last message ----------------------
     after = []
