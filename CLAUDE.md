@@ -27,6 +27,8 @@ tools/offset_sweep.py       start-offset ensemble (DR on/off) -- use before any 
 tools/sweep_report.py       cross-bag table; merges baseline + --tag experiment JSONs per bag
 tools/dr_vertical_check.py  does DR leak horizontal velocity into v_z (corr is NOT specific;
                             compare against DR off)
+patches/fastlio2_ros2.patch   our changes to FASTLIO2_ROS2 pgo (init, isotropic noise, loop log)
+nav_src/x2_nav/               OURS: pgo_offline (deterministic pgo driver), configs
 patches/point_lio_ros2.patch  our changes to upstream (pcl_ros, QoS, rx counter, bag_path,
                             DR factor, publish_tf gate, deterministic replay)
 slam_ws/src/x2_cloud_adapter/  OURS: cloud adapter + slam_publisher + config + launch
@@ -61,6 +63,13 @@ X2_HOST=soc1ap ./record_walk.sh --fetch       # stop, verify, copy here, delete 
 
 # --- evaluate -------------------------------------------------------------
 ./tools/run_point_lio_det.sh data/bags/<bag> <outname>     # ~15 s, repeatable
+RECORD_CLOUDS=1 ./tools/run_point_lio_det.sh <bag> <out>   # + /cloud_registered (for pgo)
+./tools/bootstrap_nav_ws.sh                   # nav_ws: pgo/localizer (patched) + x2_nav
+source nav_ws/install/setup.bash
+ros2 run x2_nav pgo_offline results/<out> nav_src/x2_nav/config/pgo_x2.yaml results/<out>_pgo
+ros2 run x2_nav localizer_offline <map.pcd> results/<walk> nav_src/x2_nav/config/localizer_x2.yaml \
+     results/<reloc_out> --search          # or --init x,y,z,yaw_deg (= T_map<-camera_init)
+./tools/compare_traj.py <est_traj_bag> <ref_traj_bag> [--ref-shift x,y,z,yaw]
 ./tools/eval_trajectory.py results/<outname> data/bags/<bag>
 ./tools/analyze_bag.py data/bags/<bag>
 ./tools/dr_payoff.py results/<outname> data/bags/<bag>   # DR payoff bound
@@ -121,12 +130,19 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
     task_manager is running but its subscriptions could not be enumerated (cross-panel
     discovery is intermittent and asymmetric). Unconfirmed, not false.
 15. **Never command motion except through `tools/loco_cmd_test.py`** (runs on soc1). It is
-    the only code that can move the robot: interlock on `GetMcAction` description
-    `LOCOMOTION_DEFAULT` + RUNNING (the numeric action field reads 0 -- never gate on it),
-    caps 0.2 m/s / 3 s, BEST_EFFORT+VOLATILE (no latching), 5 Hz mode re-check, explicit
-    zeros on every exit after commanding, stop check. **Never call `SetMcAction`** -- the
-    operator changes modes with the remote. Robot needs an operator with the remote's
-    e-stop and clear space for any non-dry run.
+    the only code that can move the robot.
+    - **Source.** It publishes as `source: 'pnc'`, the registered planning-and-control
+      input (priority 40, below the remote's 80). mc silently DROPS any unregistered
+      source name.
+    - **Interlock.** It checks the `GetMcAction` description: `STAND_DEFAULT` or
+      `LOCOMOTION_DEFAULT` + RUNNING. mc auto-switches stand <-> walk on commands. The
+      numeric action field reads 0, so never gate on it.
+    - **Limits.** Caps 0.2 m/s and 3 s, BEST_EFFORT+VOLATILE (no latching), 5 Hz mode
+      re-check, explicit zeros, then a stop check.
+    - **Never call `SetMcAction` or `SetMcInputSource`.** Never publish as `rc` (the
+      remote must keep priority).
+    - **People and space.** Any non-dry run needs an operator holding the controller and
+      clear space.
 16. **Never leave a run in `/agibot/data/bag/` uncopied.** It is a ~27 min rolling
     buffer; older segments are gone.
 17. **Never run FASTLIO2_ROS2 `pgo`/`localizer` on the robot's bus unremapped.** Both
@@ -134,6 +150,9 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
     under `ROS_LOCALHOST_ONLY=1` with a private `ROS_DOMAIN_ID`. Never run the two together.
     **Never use their `fastlio2`** (Livox-only input, accel x10). Details: README,
     "Mapping and relocalisation".
+18. **Never run the localizer with 6-DOF ICP** (`yaw_only: false`). On the X2 it settled on
+    a solution tilted 3.7 deg / 14 cm high that passed every fitness gate. The 4-DOF
+    estimator (`yaw_estimation.h` in the patch) is the fix.
 
 ## Sensor facts worth not re-deriving
 
