@@ -49,6 +49,8 @@ EXTRA_TOPICS=(
   /aima/hal/sensor/lidar_chest_front/lidar_status
   /aft_mapped_to_init                                   # live Point-LIO output,
                                                         # present only with live_slam.sh
+  /x2/localization/odometry                             # live localizer output (nav_msgs),
+  /x2/localization/status                               # only with live_slam.sh --localize
 )
 
 # The point cloud alone is ~7.9 MB/s; everything together is ~12 MB/s.
