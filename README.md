@@ -2609,6 +2609,203 @@ pgo map). The truth available is each walk's own return to its mark:
 - A height prior (same floor => z offset ~ 0) would have rejected the implausible
   hypothesis. Not implemented yet.
 
+**Mapping step 4 (2026-10-14): first map + test walk with ground truth** (`RUNBOOK_mapping_walk.md`).
+
+`map_walk_01`: 268 s, 66.7 m. Loop, 180 deg turn on the home mark, the same loop reversed,
+180 deg back. Operator: ended **one X2 foot-width to the right**, heading on the edge.
+`test_walk_01`: 140 s, 28.3 m, irregular moves in part of the map. Operator: ended **9 cm
+behind** the starting pose, heading unchanged.
+
+- **Point-LIO's closure direction now has real ground truth: it matches every operator
+  report.**
+  - How it's measured: `tools/closure_in_robot_frame.py`. Robot-forward in the IMU frame
+    is measured from leg odometry while walking: ~[0, -0.07, -1.0], i.e. -z, consistent
+    across 5 walks.
+
+  | walk | Point-LIO closure (start frame) | operator |
+  |---|---|---|
+  | map_walk_01 | 3 cm behind, **9.6 cm right** | one foot-width right |
+  | test_walk_01 | **13 cm behind**, 8 cm left | 9 cm behind |
+  | marked_loop_03 | **14 cm behind** | 6 cm behind |
+  | marked_loop_02 | **7 cm ahead**, 4 cm left | left foot 6 cm ahead |
+
+- **pgo upstream broke this map; two principled fixes repaired it.**
+  - **The failure.** 7 of its 10 loops paired scans facing **110-178 deg apart** (one
+    loop walked each way). Those scored 0.09-0.15 m² against the 0.15 gate; the 3
+    same-direction loops scored 0.02-0.05. A forward-only 123 deg LiDAR shares almost no
+    surfaces between opposite views, so those loops are false by construction. Result:
+    closure 0.10 -> **0.44 m** (43 cm *forward*).
+  - **The fixes, in the patch:**
+    - `loop_max_angle_deg: 60`: only try candidates facing within 60 deg, i.e. at least
+      ~half the FOV shared;
+    - `yaw_only_icp: true`: the same 4-DOF estimator as the localizer.
+
+  | pgo variant on map_walk_01 | loops | closure | dz |
+  |---|---|---|---|
+  | upstream | 10 | 43 cm fwd, 7 cm right | -9 cm |
+  | gate only | 7 | 6 cm behind, 7 cm right | -12 cm |
+  | 4-DOF only | 11 | 10 cm fwd, 15 cm left | -2 cm |
+  | **gate + 4-DOF (default now)** | 7 | **6 cm behind, 5.5 cm right** | -3 cm |
+
+  `marked_loop_03` is unaffected: its one loop is same-direction. **pgo is not shown to
+  beat Point-LIO alone** on these walks; both sit within ~5 cm of the operator's report.
+  What pgo now provides is a map that is no worse.
+
+- **Relocalising test_walk_01 on `results/map01/map.pcd`** (`tools/dwell_vs_home.py`;
+  HOME = the mapping walk's first stand-still):
+
+  | | --init 0,0,0,0 (start on mark) | --search (start unknown) |
+  |---|---|---|
+  | search result | (given) | #1 95.1 % inliers (x -0.04, y -0.10, yaw 5.4); #2 91.8 % is 23 cm away. No far-off rival |
+  | test start vs HOME | 6.6 cm behind, 4.4 right, +4.65 deg | identical within 0.3 cm |
+  | test end vs HOME | 18.7 cm behind, 1.8 left, +14.3 deg | identical |
+  | ICP accepted | 138/140 | 138/140 |
+
+  - **Possible strong consistency check (still to confirm).** The test walk's localised
+    start (6.6 behind, 4.4 right, +4.65 deg) is within **1.1 cm and 0.1 deg** of where pgo
+    put the *mapping* walk's end (6.4 behind, 5.5 right, +4.77 deg). If the robot was not
+    moved between the two walks, the localiser recovered that pose almost exactly. Ask the
+    operator.
+  - **End vs start of the test walk:** ~12 cm behind, 6 cm left. Operator: 9 cm behind.
+  - ~~Corrections jump 20-52 cm~~ **RETRACTED: wrong metric.** It compared the corrections'
+    translations, which mixes in yaw x distance from the map origin (a 2 deg tweak 7 m out
+    = 24 cm). See "Correction jumps" below for the right measure.
+
+- **UNRESOLVED: heading.**
+  - **What the sensors say.** At each walk's end, LiDAR scan-to-map registration, Point-LIO
+    and leg-odometry's gyro all agree the chest is rotated +4.8 deg (map walk) and +9.6 deg
+    (test walk, relative to its start).
+  - **What the operator says.** Heading unchanged.
+  - **Torso twist ruled out.** The joints (`tools/stance_heading.py`) show waist-yaw change
+    <= 1.0 deg and mean hip-yaw change <= 1.2 deg on all 5 walks.
+  - **Status.** Positions agree; headings do not. Not explained.
+
+**Operator answers (2026-10-14).**
+- The robot did **not** move between the end of `map_walk_01` and the start of
+  `test_walk_01`. So the localiser putting the test start **1.0 cm / 0.1 deg** from pgo's
+  map-walk end is a confirmed consistency check.
+- "9 cm behind" was eyeballed relative to the test start and could be 12 cm. The localiser
+  says 11.5 cm behind, 7 cm left.
+- **One X2 foot-width = 12.5 cm**, so map_walk_01 ended 12.5 cm right. Point-LIO alone is
+  ~4 cm off that (3 behind, 9.6 right). pgo is ~9.5 cm off (6.4 behind, 5.5 right): pgo
+  is slightly *worse* here.
+
+**Correction jumps: re-measured, and the operator's door-threshold hypothesis.**
+- **Right metric.** How far the robot's MAP position moves when a correction is applied
+  (old vs new correction on the same odometry pose; `tools/reloc_metrics.py`). On
+  test_walk_01: **p90 ~1 cm, max 17 cm**. No frame-to-frame map speed exceeds 1.5 m/s;
+  leg odometry peaks at 1.0 m/s. The driver's "max accepted jump" uses this measure now.
+- **Where the > 5 cm corrections are.** All but three fall in 44-67 s and 81-84 s.
+  - Operator: a 3-4 cm door threshold, a half-foot on it, a balance recovery in the final
+    third before the stand.
+  - The data agree. At 80-84 s, peak speed is 1.0 m/s (normally 0.6-0.75) and turn rate
+    1.66 rad/s, the walk's maximum. At 59.5 s, leg odometry has a single -11.6 cm z blip.
+  - **But the trigger is not only the threshold.** Point-LIO's height was already
+    **+14-27 cm wrong** in both windows while leg odometry stayed flat (+-2 cm), then
+    snapped back by 12-16 cm at 59.5 and 82.5 s. This is the known DR mid-walk height
+    error, here at its worst. The localiser's free z chased it (one +51 cm z correction).
+- **Variants on test_walk_01** (all `--init`; truth: start = map-walk end, end ~9-12 cm
+  behind start):
+
+  | accum_scans | lock_z | max jump | p90 | end vs start | start vs map-walk end |
+  |---|---|---|---|---|---|
+  | 1 | no | 17.0 cm | 0.9 | 11.5 behind, 7.3 left | 1.0 cm |
+  | 1 | yes | 20.0 | 1.0 | 11.2, 6.8 | 1.2 |
+  | 5 | no / yes | 23.3 / 21.4 | 1.4 / 0.9 | ~11, ~7 | 0.7 / 1.0 |
+  | 10 | no / yes | 19.9 / 20.0 | 1.6 / 0.8 | ~11, ~6.5 | 0.7 / 1.1 |
+
+  Accumulation does not help: kept at 1. `lock_z` (3-DOF x, y, yaw; **one level floor
+  only**) is now the default because of the search, not the tracking: it removes
+  marked_loop_02's impossible z = +0.52 m rival. Its ranking becomes a cluster of nearby,
+  similar-heading answers. It fits this older map no better (0.158 m closure); that is
+  the coverage problem.
+- **For the controller.** Corrections of <= 17 cm at 1 Hz, concentrated where the
+  odometry itself is glitching. Acceptable against a 1 m target. For 30 cm, smooth them in
+  the publisher (blend over ~1 s) rather than in ICP. The real lever is Point-LIO's
+  mid-walk height error, which is parked but now has a concrete navigation cost.
+
+**Step 5 prepared (2026-10-15): live localisation node. Validated on the laptop; robot run pending.**
+- **Shared code.** `nav_src/x2_nav/src/reloc_core.hpp` holds the search and tracking used by
+  BOTH `localizer_offline` and the new `localizer_live`. The refactor reproduced the earlier
+  `--init` and `--search` trajectories **bit-for-bit**.
+- **`localizer_offline --local x,y,z,yaw`.** Searches +-1 m / +-30 deg (0.5 m, 10 deg; 175
+  seeds) around a rough prior, using the first 3 s of scans (the stand-still). On failure
+  (best inliers < 60 %) it slides to the next 3 s.
+  - test_walk_01 from prior 0,0,0,0: 99.7 % vs 98.4 % for a rival 30 cm / 4 deg away. A
+    single standing view is less distinctive. Tracking converges to the same answer either
+    way; 2.3 s of search on the laptop.
+- **`localizer_live`.**
+  - **Data flow.** Subscribes `/aft_mapped_to_init` + `/cloud_registered` and pairs them by
+    stamp. Callbacks only queue; one worker runs the startup local search, then tracks
+    EVERY frame in order.
+  - **Outputs.** `/x2/localization/odometry` (nav_msgs, frame `map`, nothing until
+    localised) and `/x2/localization/status`. **Never `/tf`, never commands.**
+  - **Laptop validation.** Fed test_walk_01's recorded odometry + clouds by `ros2 bag play`
+    at 0.5x and 1.0x (~9x real time). Output poses AND the ICP attempt log are
+    **bit-identical** to `localizer_offline --local` (1397/1397, 140/140). Queue <= 5, no
+    unpaired messages.
+  - **Stopping.** `ros2 run` does not forward SIGINT to the node; the node kept running.
+    Start the binary directly and stop it with `pkill -INT -x localizer_live` (exits in
+    ~1 s, log flushed per line).
+- **On the robot (2026-10-15, static check: robot wherever it stood, no walk, no recording):**
+  - `deploy_nav_robot.sh` built x2_nav on soc1 in 1.5 min. soc1 has GTSAM too (4.2.0).
+    `x2_ultra.yaml` is identical on robot and laptop.
+  - **Bug caught by the check.** `--init 0,0,0,0` reached the node as an INTEGER array
+    and the node (declares doubles) aborted. `live_slam.sh` now always sends decimals.
+  - **Works.**
+    - Startup search 6.7 s on the Orin (175 seeds). The 68-frame backlog drained in ~10 s;
+      then queue 1, i.e. the pose is < 0.1 s behind.
+    - ICP 31/31 accepted.
+    - CPU: localizer_live ~25 % of one core, 130 MB; Point-LIO ~41 %.
+  - **Its answer is NOT trustworthy yet.** About 0.7 m behind and 1.8 m left of the old
+    home, turned 33 deg clockwise. The top 3 nearly tie (85.0 / 84.2 / 84.0 % inliers,
+    0.5-0.9 m apart), and refine fitness is 0.015 m² against ~0.003 on test_walk_01. The
+    robot was not on a mark; to be checked against where it actually stood.
+- **Robot integration:**
+  - `tools/deploy_nav_robot.sh` syncs `nav_src`, the three FASTLIO2_ROS2 packages, the
+    patch and `maps/map01.pcd`, then builds on soc1 with `bootstrap_nav_ws.sh --robot`
+    (x2_nav only; no GTSAM there, pgo_offline skipped).
+  - `live_slam.sh --localize MAP [--init x,y,z,yaw]` starts the localizer after Point-LIO
+    and before the recorder; `--status` shows it, `--stop` stops it.
+  - `record_walk.sh` records `/x2/localization/{odometry,status}` when present.
+  - Operator steps: `RUNBOOK_live_localization.md`.
+
+**Step 5 done (2026-10-15): first LIVE localisation walk, `loc_walk_01`**
+(`RUNBOOK_live_localization.md`; new tape mark near the old home; office -> corridor -> office).
+- **The run.** 170 s recorded (50 s stand, 82 s walk, 38 s stand).
+  - Live: LOCALISED in 5.3 s on the Orin, 97.6 % vs a 93.0 % rival.
+  - 323/331 ICP accepted over 5.5 min; queue 1, no unpaired messages; clean stop.
+  - One person walked around during the walk.
+  - Operator's return to the mark: left foot 9 cm behind + 5 cm right, right foot 1 cm
+    behind + 5 cm right, heading right. Mean **~5 cm behind, ~5 cm right**.
+
+  | source | closure (end vs start, start heading) | heading |
+  |---|---|---|
+  | **live localizer (robot)** | **6.1 behind, 5.3 right** | -2.6 deg |
+  | offline localizer (laptop replay) | 6.5 behind, 4.7 right | -2.7 deg |
+  | live Point-LIO alone | 7.1 behind, 5.7 right | -2.6 deg |
+  | offline Point-LIO alone | 7.3 behind, 6.8 right | -2.5 deg |
+
+  The live end-vs-start is within ~1-2 cm of the operator's measurement.
+- **Start vs the old home.** Live and offline agree to 0.1 cm: the new mark is ~30 cm
+  right of the old one, turned ~7 deg clockwise. Not verifiable; the operator placed it
+  "about there".
+- **Latency** (bag receive time minus scan-end stamp, PTP clocks):
+  `/x2/localization/odometry` median **22 ms**, p95 156 ms, max 219 ms. Point-LIO's own
+  output: 21 / 26 / 50 ms. The p95 is frames queued behind a 1 Hz ICP attempt on the Orin.
+- **Mid-walk the live pose is worse, and the cause is LIVE Point-LIO's height.**
+  - Live vs offline map pose: median 2 cm, **p95 18 cm, max 33 cm, max 8.7 deg**. All of
+    it falls in 50-125 s.
+  - In 80-125 s **live Point-LIO's height swung +39 cm then -24 cm**, while leg odometry
+    was flat (+-2.5 cm) and the offline replay stayed within +-9 cm.
+  - The live ICP shows it: in 80-125 s, 38/45 accepted at refine fitness 0.026 m², vs
+    offline 45/45 at 0.007. Before and after the window they agree to ~1 cm.
+  - So the parked "DR costs mid-walk height" problem is **worse live than in replay**,
+    and it is now **the largest mid-walk localisation error** (up to ~33 cm). The
+    localizer (3-DOF) cannot correct it: the distorted attitude and height bias its
+    horizontal fit.
+  - Fine for the 1 m target; in the way of 30 cm.
+
 **Navigation acceptance target** (operator, 2026-10-14): the robot ends inside a
 **1 m x 1 m area** at each waypoint.
 
