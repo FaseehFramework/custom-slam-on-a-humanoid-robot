@@ -22,13 +22,17 @@ tools/live_slam.sh          start/stop/status live SLAM on the robot
 tools/loco_cmd_test.py      FIRST MOTION TEST (on soc1): tiny velocity command, interlocked
 tools/decode_locomotion_cmd.py  decode recorded locomotion commands (no aimdk typesupport)
 RUNBOOK_live_walk.md        step-by-step live walking run (hand to the operator)
+RUNBOOK_mapping_walk.md     mapping walk (both directions) + test walk from the home mark
+RUNBOOK_live_localization.md  live localization walk (operator steps)
+tools/deploy_nav_robot.sh   sync + build the localizer on soc1 (no GTSAM there), copy maps
 tools/dr_payoff.py          bounds what a leg-odometry DR factor would recover
 tools/offset_sweep.py       start-offset ensemble (DR on/off) -- use before any claim
 tools/sweep_report.py       cross-bag table; merges baseline + --tag experiment JSONs per bag
 tools/dr_vertical_check.py  does DR leak horizontal velocity into v_z (corr is NOT specific;
                             compare against DR off)
 patches/fastlio2_ros2.patch   our changes to FASTLIO2_ROS2 pgo (init, isotropic noise, loop log)
-nav_src/x2_nav/               OURS: pgo_offline (deterministic pgo driver), configs
+nav_src/x2_nav/               OURS: pgo_offline, localizer_offline, localizer_live (shared
+                              reloc_core.hpp), configs
 patches/point_lio_ros2.patch  our changes to upstream (pcl_ros, QoS, rx counter, bag_path,
                             DR factor, publish_tf gate, deterministic replay)
 slam_ws/src/x2_cloud_adapter/  OURS: cloud adapter + slam_publisher + config + launch
@@ -68,8 +72,11 @@ RECORD_CLOUDS=1 ./tools/run_point_lio_det.sh <bag> <out>   # + /cloud_registered
 source nav_ws/install/setup.bash
 ros2 run x2_nav pgo_offline results/<out> nav_src/x2_nav/config/pgo_x2.yaml results/<out>_pgo
 ros2 run x2_nav localizer_offline <map.pcd> results/<walk> nav_src/x2_nav/config/localizer_x2.yaml \
-     results/<reloc_out> --search          # or --init x,y,z,yaw_deg (= T_map<-camera_init)
+     results/<reloc_out> --search          # or --init / --local x,y,z,yaw_deg (= T_map<-camera_init)
 ./tools/compare_traj.py <est_traj_bag> <ref_traj_bag> [--ref-shift x,y,z,yaw]
+./tools/closure_in_robot_frame.py results/<run> data/bags/<bag>   # closure as forward/left (vs operator)
+./tools/dwell_vs_home.py <map_final> <map_bag> <walk_traj> <walk_bag>  # walk start/end vs HOME mark
+./tools/stance_heading.py data/bags/<bag>     # waist/hip yaw at start vs end (chest-vs-feet)
 ./tools/eval_trajectory.py results/<outname> data/bags/<bag>
 ./tools/analyze_bag.py data/bags/<bag>
 ./tools/dr_payoff.py results/<outname> data/bags/<bag>   # DR payoff bound
@@ -79,6 +86,8 @@ ros2 run x2_nav localizer_offline <map.pcd> results/<walk> nav_src/x2_nav/config
 ./tools/sweep_report.py                                           # merged table
 
 # --- on the robot ---------------------------------------------------------
+./tools/deploy_nav_robot.sh                   # localizer + maps/map01.pcd -> soc1, build there
+./tools/live_slam.sh --start --record NAME --localize map01 [--init x,y,z,yaw]
 ssh soc1
 source /opt/ros/humble/setup.bash
 export FASTRTPS_DEFAULT_PROFILES_FILE=/agibot/software/entry/cfg/ros_dds_configuration.xml
@@ -153,6 +162,12 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
 18. **Never run the localizer with 6-DOF ICP** (`yaw_only: false`). On the X2 it settled on
     a solution tilted 3.7 deg / 14 cm high that passed every fitness gate. The 4-DOF
     estimator (`yaw_estimation.h` in the patch) is the fix.
+19. **Never run pgo without the heading gate** (`loop_max_angle_deg: 60`). Forward-only
+    LiDAR: loops between opposite views pass the score gate and are false. They broke
+    `map_walk_01` (closure 0.10 -> 0.44 m).
+20. **Never stop `localizer_live` via `ros2 run`'s PID.** SIGINT to `ros2 run` does not reach
+    the node, and it keeps running. Start the binary directly; stop it with
+    `pkill -INT -x localizer_live` (exact name; cannot self-match).
 
 ## Sensor facts worth not re-deriving
 
