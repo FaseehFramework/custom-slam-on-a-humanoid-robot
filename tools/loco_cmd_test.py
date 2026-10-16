@@ -47,7 +47,7 @@ Usage on soc1 (dry run first: does everything except publish a non-zero command)
   python3 loco_cmd_test.py --dry-run
   python3 loco_cmd_test.py --forward 0.10 --duration 2.0
 """
-import argparse, csv, math, os, signal, sys, threading, time
+import argparse, csv, fcntl, math, os, signal, sys, threading, time
 
 import rclpy
 from rclpy.node import Node
@@ -65,6 +65,7 @@ INPUT_SRC_SRV = '/aimdk_5Fmsgs/srv/GetCurrentInputSource'
 MAX_FWD, MAX_DUR, RATE_HZ, ZERO_TAIL_S, WATCH_AFTER_S = 0.20, 3.0, 50.0, 1.0, 4.0
 MAX_START_WAIT = 3.0
 SOURCE = 'pnc'           # registered planning-and-control source, priority 40 < rc 80
+LOCKFILE = '/tmp/x2_motion.lock'   # shared with waypoint_follower.py: one motion tool at a time
 
 
 class Tester(Node):
@@ -167,6 +168,14 @@ def main():
     if not (0.0 < a.max_start_wait <= MAX_START_WAIT):
         sys.exit(f'--max-start-wait must be within 0..{MAX_START_WAIT} s (hard cap)')
     fwd = 0.0 if a.dry_run else a.forward
+    lock_fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o644)   # held until exit; dropped on any death
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(f'refusing: another motion tool is running (lock {LOCKFILE}: '
+                 f'{os.pread(lock_fd, 64, 0).decode(errors="replace").strip()})')
+    os.ftruncate(lock_fd, 0)
+    os.pwrite(lock_fd, f'pid {os.getpid()} loco_cmd_test'.encode(), 0)
 
     rclpy.init()
     n = Tester(a.log)
