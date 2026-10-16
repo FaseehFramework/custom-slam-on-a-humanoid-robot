@@ -2405,6 +2405,37 @@ live test 1 switch stand -> walk):
 zero stream. mc starts and stops walking itself, expires stale commands after 1 s, and
 the operator's stick outranks us. The navigation layer has what it needs.
 
+## Steering facts for the waypoint follower (2026-10-15, recorded walks only, no motion)
+
+Checked before designing the follower, from the remote's commands and leg odometry on four
+walks (`tools/cmd_tracking.py`) and the live map pose of `loc_walk_01` (`tools/heading_check.py`).
+
+- **`angular_velocity > 0` turns the robot counter-clockwise (left) in the map.**
+  - corr(command, leg-odometry yaw rate) is **+0.92 to +0.97** at 0-0.25 s lag, on
+    loc_walk_01, map_walk_01, test_walk_01 and live_walk_01.
+  - Leg odometry's world frame and the map frame agree on the sign of every turn: 24/24
+    two-second chunks, corr +0.995, median difference 1.5 deg.
+  - The map frame is z-up: `closure_in_robot_frame.py` put the loc_walk_01 end 5.3 cm
+    *right*, and the operator saw ~5 cm right. A flipped z would have said left.
+- **Command -> motion lag is ~0.25-0.5 s.** Turn rate correlates best at 0-0.25 s, speed at
+  0.5 s (1.0 s on live_walk_01).
+- **Speed follows the command roughly 1:1 up to 0.6 m/s** on map_walk_01, the largest sample
+  (1 s bins: 0.02-0.1 -> 0.085, 0.1-0.2 -> 0.16, 0.2-0.3 -> 0.26, 0.3-0.45 -> 0.37,
+  0.45-0.6 -> 0.48 m/s). The other walks scatter more, because the stick is almost never
+  held steady and a window that straddles a deceleration pairs a low mean command with fast
+  motion. **Tracking at a steady 0.1-0.2 m/s is still unmeasured.** The follower's own logs
+  will measure it.
+  - Correction: `decode_locomotion_cmd.py`'s "max cmd fwd" is the max over its 1 s
+    *samples*, not over all messages. On loc_walk_01 it said 0.404 against 0.592 m/s achieved;
+    the full stream peaks at 0.707.
+- **The robot's heading comes from the map pose:** `R_map_body * f_body`, projected
+  horizontal. `f_body` (robot-forward in the IMU frame, from leg-odometry walking velocity)
+  is about `-z_body` on every walk, but its heading component varies between walks:
+  -4.1 (map_walk_01), -3.6, -1.5, +0.2, +0.8, +0.8 deg. On loc_walk_01's straight spans,
+  pose heading minus travel direction is median -0.5 deg with map_walk_01's `f_body` and
+  +3.8 deg with its own. **Robot heading is known to about +-3 deg.** A follower that
+  re-aims at the waypoint every cycle turns that into a slight curve, not an arrival error.
+
 # Mapping and relocalisation with FASTLIO2_ROS2 `pgo` + `localizer` (2026-10-14, source read only)
 
 Plan: freeze our odometry (Point-LIO + DR mode 1) and use only two downstream nodes from
@@ -2808,6 +2839,164 @@ behind** the starting pose, heading unchanged.
 
 **Navigation acceptance target** (operator, 2026-10-14): the robot ends inside a
 **1 m x 1 m area** at each waypoint.
+
+# Waypoint follower (2026-10-15): stage A, built and tested OFFLINE ONLY
+
+**Nothing here has run on the robot yet.** Stage A is the laptop stage: code, a simulator,
+an end-to-end test against a fake robot, and an independent review.
+
+## What it does
+
+The operator drives the robot to a spot and saves the localised pose under a name (`mark`).
+A route is an ordered list of names. The follower walks **straight legs** between them, so
+waypoints go where each leg is clear: doors, corridor corners. **There is no obstacle
+avoidance**; the operator is the obstacle avoidance (stick or e-stop).
+
+Per leg:
+1. **TURN.** Turn in place until the heading is within 10 deg of the bearing to the goal.
+2. **WALK.** Walk at <= 0.2 m/s (slowing to >= 0.08 m/s within 0.5 m of the goal), steering
+   toward it. If the heading drifts > 30 deg off, it stops and turns again; the approach line
+   is rebuilt from where it is.
+3. **ARRIVE.** Within 0.25 m, or passing abeam of the goal inside 0.4 m: zeros, wait for mc to
+   stand, then measure where it actually stopped (mean of 1 s of poses).
+4. **ALIGN** (optional, last waypoint): turn in place to the waypoint's saved heading.
+
+```
+./tools/follow.sh mark NAME            # robot still, localised; publishes nothing
+./tools/follow.sh list
+./tools/follow.sh plan --from S A B    # preflight + legs; publishes nothing
+./tools/follow.sh shadow A B           # operator drives, follower computes; NO publisher
+./tools/follow.sh go --from S A B [--align-final]   # walks; typed GO or --confirm
+./tools/follow.sh stop                 # SIGINT to a running follower, from another terminal
+```
+
+Files: `tools/follower_core.py` (all decisions, pure Python), `tools/waypoint_follower.py`
+(ROS on soc1), `tools/follow.sh` (laptop, `ssh -tt`) and `tools/follow_robot.sh` (soc1
+environment). Waypoints live in `maps/<map>_waypoints.json` on soc1, with the sha1 of the map
+they were captured on.
+
+## Facts measured for it (recorded data only)
+
+- **Turn sign, lag, speed, heading:** README "Steering facts for the waypoint follower".
+- **The chest IMU is 0.11-0.15 m ahead of the point the robot turns about.**
+  - Fit `chest = centre + Rz(heading) @ offset` over slow in-place turns: map_walk_01 x3,
+    marked_loop_02 x1, fit rms 1-2 cm. Fast turns while walking fit walking arcs instead
+    (offsets 0.2-0.6 m sideways) and were excluded.
+  - Static tf alone puts the IMU 0.09 m ahead of torso_link.
+  - Without this, a 180 deg turn in place moves the measured position by 2 x 0.13 = 0.26 m.
+    In simulation, arrivals followed by ALIGN grew from 0.16 m to 0.39 m before the fix.
+  - **The follower steers and measures the turning centre**, chest - 0.13 m forward, and
+    saves waypoints the same way.
+- **Gait sway on the live heading:** p50 3.4 deg, p95 10.4 deg, max 24.7 deg around a 2 s mean
+  (loc_walk_01, operator speed). Standing: p95 0.12 deg. The follower steers on a 0.6 s
+  circular mean.
+- **Live localisation, loc_walk_01:**
+  - Pose at 10.0 Hz, never a gap > 0.1 s.
+  - Largest per-update pose step 0.224 m, which is an accepted ICP correction.
+  - Accepted correction jumps: max 0.223 m, p95 0.081 m.
+  - Max consecutive ICP rejections: **7**, in the height-swing window; 8 rejections in total.
+- **The follower's own heading on live data** (`heading_check.py`, F_BODY through the
+  follower's `heading_from_quat`): median +2.3 deg vs direction of travel on straight spans,
+  within the +-3 deg estimate.
+
+## Limits and why (`follower_core.Params`)
+
+| Limit | Value | Why |
+|---|---|---|
+| forward / turn caps | 0..0.20 m/s / +-0.30 rad/s, sideways 0 | hard caps, in code twice and in CLAUDE.md #15 |
+| pose silent / old | 0.5 s / 1.0 s | 10 Hz, no gap > 0.1 s seen |
+| ICP rejections in a row | **8** | loc_walk_01 max was 7. The plan said 3, which would have stopped that walk mid-route. |
+| pose jump per update | **0.4 m** / 15 deg | accepted corrections reach 0.22 m. The plan said 0.3 m, too close. |
+| no progress | **6 s** | min speeds 0.08 m/s, 0.10 rad/s. The plan said 5 s. |
+| wrong way | 25 deg against the turn command / 0.3 m away | turning judged on the robot's own rotation, which a position correction cannot move |
+| leg line | 1 m sideways | localisation error mid-walk up to 0.33 m |
+| start | within 0.3 m / 15 deg of the `--from` waypoint | catches a wrong-but-confident localisation (the static check once tied 85.0/84.2/84.0 %) |
+| leg length | 10 m; time limit length/0.08 + 30 s | |
+| mc start | 4 s from our first command | 0.23 s normal, 2.6 s behind an animation |
+
+**Stops, sends zeros and never resumes on:**
+- any stick input from the remote (forward, turn or sideways, even 0.02);
+- another program publishing as `pnc`;
+- the remote's ~49 Hz stream silent > 1 s (controller off or disconnected);
+- mode not STAND/LOCOMOTION_DEFAULT, or GetMcAction silent > 1 s;
+- each localisation limit above, plus a non-finite pose;
+- Ctrl-C, Ctrl-\ (SIGQUIT), SIGTERM, SIGHUP. Ctrl-Z is ignored.
+
+Zeros go out *before* anything is printed, and printing happens on its own thread, so a
+frozen (Ctrl-S) or dead terminal cannot hold them back.
+
+**After every run:** a "did it stop?" check on **leg odometry** (independent of localisation),
+which says "operator is driving" rather than raising an alarm after a takeover.
+
+**Refuses to start, publishing nothing, unless:**
+- every check above passes with the robot standing and the remote idle;
+- the localizer runs on `maps/<map>.pcd` and that file's sha1 matches the waypoints';
+- it holds `/tmp/x2_motion.lock`, which `loco_cmd_test.py` now takes too. The lock is taken
+  before the GO prompt and the kernel drops it on any death.
+
+## Testing
+
+- **`tools/test_follower.py`:** the real `run_route` against a simulated robot and mc in
+  virtual time, ~40 s.
+  - **Scenarios:** 48 (nominal, model errors, every fault, every refusal), run twice: with
+    mc's 1 s expiry, and **without it**, so the follower's own zeros alone must stop the
+    robot.
+  - **Invariants on every run, against the rule's literal numbers:**
+    - caps;
+    - a continuous >= 1 s zero tail (>= 15 messages, no gap > 0.1 s);
+    - nothing sent when refused;
+    - robot at rest afterwards;
+    - for faults, a deadline for the last non-zero command.
+  - **Plus:** 300 random routes, and a shadow run.
+  - **Simulated arrival error** (estimate, 760 arrivals): median 0.16 m, p95 0.22 m, max 0.33 m.
+    True end <= 0.45 m with up to 0.15 m of slowly varying localisation bias.
+- **`tools/test_follower_ros.sh`:** the real `waypoint_follower.py` as a subprocess against a
+  fake robot node. Fully isolated (`ROS_LOCALHOST_ONLY=1`, private domain), with laptop-only
+  fake `aimdk_msgs` built from the field layout read on soc1
+  (`tools/test_fixtures/aimdk_msgs_fake`, never deployed). 23 cases:
+  - mark/list/plan;
+  - a nominal route;
+  - SIGINT, SIGHUP, SIGTERM, SIGQUIT;
+  - forward and turn-only takeovers, another pnc publisher;
+  - localisation freeze, controller loss, e-stop;
+  - start off the waypoint, SIGKILL, two runs 0.05 s apart, no terminal, changed map;
+  - shadow publishing nothing.
+
+  It found three things the core tests could not:
+  - an interpreter abort on exit (rclpy spin thread not joined);
+  - DDS discovery slower than the first 2 s preflight;
+  - the zero tail must be checked on the wire.
+- **Independent review**, as a workflow: four reviewers (stop paths, control, robot
+  integration, tests), then one skeptic tasked with refuting each finding.
+  - 26 findings, 23 confirmed, none critical. All 23 are fixed; this section describes the
+    fixed code.
+  - **Medium:**
+    - two runs could pass the old PID-file check together and send contradictory turns
+      (reproduced);
+    - Ctrl-\ killed it without zeros;
+    - a Ctrl-S-frozen terminal blocked the abort's zeros;
+    - the after-stop check read the localisation pose, so it reported "0.0 m" exactly when
+      localisation had died, and shouted "e-stop" at an operator who had taken over to steer;
+    - a re-turn loop near the goal;
+    - no physical check of the start;
+    - nine weak tests. Examples: raising MAX_ANG to 0.45 passed both suites, and a broken
+      controller-loss stop passed because no deadline was asserted.
+  - **Mutation check of the strengthened suite:** 15 of 16 deliberately broken followers are
+    caught. The survivor arms the turn watchdog before mc reports walking. No realistic case
+    makes that matter: the 4 s start limit always fires before the 6 s stall check. The
+    arming is kept as harmless margin, without a separate test.
+
+## What the tests cannot show (stages B and C)
+
+- **mc dropping a `pnc` command after 1 s with no zeros following.** Every simulator check of
+  it tests the simulator. Stage C kills the follower mid-walk on purpose.
+- **Whether the remote's stream stops when the PS5 controller is off or out of range.** The
+  heartbeat check assumes so; it was only seen absent in PASSIVE. Stage B: switch the
+  controller off with the robot standing and record.
+- **Pure turn-in-place through `pnc`** (forward 0, angular 0.1-0.3), and speed tracking at a
+  steady 0.08-0.2 m/s. Neither has been seen.
+- DDS discovery time on soc1 for the follower's topics, and the GetMcAction round trip at
+  5 Hz in Python next to the localizer.
 
 # What to record next
 
