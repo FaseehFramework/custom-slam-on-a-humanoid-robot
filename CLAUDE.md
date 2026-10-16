@@ -21,6 +21,14 @@ tools/eval_loop_closure.py  drift vs a physically marked start/end (real ground 
 tools/live_slam.sh          start/stop/status live SLAM on the robot
 tools/loco_cmd_test.py      FIRST MOTION TEST (on soc1): tiny velocity command, interlocked
 tools/decode_locomotion_cmd.py  decode recorded locomotion commands (no aimdk typesupport)
+tools/follow.sh             WAYPOINT FOLLOWER from the laptop: mark/list/plan/shadow/go/stop
+tools/follower_core.py      follower logic, pure python (caps, gates, legs, watchdogs)
+tools/waypoint_follower.py  follower ROS side on soc1 (run via follow.sh / follow_robot.sh)
+tools/test_follower.py      follower vs simulated robot + mc, every stop path (~20 s)
+tools/test_follower_ros.sh  real follower program vs fake robot node, localhost only (~4 min)
+tools/test_fixtures/aimdk_msgs_fake/  LAPTOP-ONLY fake vendor types for that test. Never deploy.
+tools/cmd_tracking.py       remote command vs leg-odometry motion (turn sign, lag, speed)
+tools/heading_check.py      turn sign leg-odom vs map; robot heading from map pose vs travel
 RUNBOOK_live_walk.md        step-by-step live walking run (hand to the operator)
 RUNBOOK_mapping_walk.md     mapping walk (both directions) + test walk from the home mark
 RUNBOOK_live_localization.md  live localization walk (operator steps)
@@ -88,6 +96,10 @@ ros2 run x2_nav localizer_offline <map.pcd> results/<walk> nav_src/x2_nav/config
 # --- on the robot ---------------------------------------------------------
 ./tools/deploy_nav_robot.sh                   # localizer + maps/map01.pcd -> soc1, build there
 ./tools/live_slam.sh --start --record NAME --localize map01 [--init x,y,z,yaw]
+./tools/follow.sh mark NAME | list | plan A B | shadow A B   # no motion (needs the localizer)
+./tools/follow.sh go A B [--align-final]      # WALKS: operator on the controller, clear space
+./tools/follow.sh stop                        # SIGINT a running follower from another terminal
+./tools/test_follower.py && ./tools/test_follower_ros.sh    # before any follower change ships
 ssh soc1
 source /opt/ros/humble/setup.bash
 export FASTRTPS_DEFAULT_PROFILES_FILE=/agibot/software/entry/cfg/ros_dds_configuration.xml
@@ -138,20 +150,39 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
     on `/slam/localization/odometry` is `soc1_drp_ros2_node3065`, the vendor *recorder*.
     task_manager is running but its subscriptions could not be enumerated (cross-panel
     discovery is intermittent and asymmetric). Unconfirmed, not false.
-15. **Never command motion except through `tools/loco_cmd_test.py`** (runs on soc1). It is
-    the only code that can move the robot.
-    - **Source.** It publishes as `source: 'pnc'`, the registered planning-and-control
+15. **Never command motion except through `tools/loco_cmd_test.py` or the waypoint
+    follower's `go` (`tools/follow.sh go` -> `tools/waypoint_follower.py` on soc1).** They are
+    the only code that can move the robot. `mark`, `list`, `plan` and `shadow` have no publisher.
+    - **Source.** Both publish as `source: 'pnc'`, the registered planning-and-control
       input (priority 40, below the remote's 80). mc silently DROPS any unregistered
       source name.
-    - **Interlock.** It checks the `GetMcAction` description: `STAND_DEFAULT` or
-      `LOCOMOTION_DEFAULT` + RUNNING. mc auto-switches stand <-> walk on commands. The
-      numeric action field reads 0, so never gate on it.
-    - **Limits.** Caps 0.2 m/s and 3 s, BEST_EFFORT+VOLATILE (no latching), 5 Hz mode
-      re-check, explicit zeros, then a stop check.
+    - **Interlock.** Both check the `GetMcAction` description: `STAND_DEFAULT` or
+      `LOCOMOTION_DEFAULT` + RUNNING to start. mc auto-switches stand <-> walk on commands.
+      The numeric action field reads 0, so never gate on it.
+    - **loco_cmd_test limits.** Caps 0.2 m/s and 3 s, BEST_EFFORT+VOLATILE (no latching),
+      5 Hz mode re-check, explicit zeros, then a stop check.
+    - **Follower limits, all in code (`follower_core.py`).**
+      - Caps: forward 0..0.2 m/s (never backwards), turn +-0.3 rad/s, sideways 0, legs <= 10 m,
+        a time limit per leg.
+      - Stops with zeros and never resumes on any of: stick input from the remote; another
+        program publishing as pnc; the remote's stream silent > 1 s; mode not
+        STAND/LOCOMOTION_DEFAULT (RUNNING or TRANSITION) or GetMcAction silent > 1 s; pose
+        silent > 0.5 s, > 1 s old or not finite; status not TRACKING or silent > 3 s; 8 ICP
+        rejections in a row; a pose jump > 0.4 m or 15 deg; rotating 25 deg against the turn
+        command, walking 0.3 m away, or no progress for 6 s; > 1 m off the leg's line;
+        Ctrl-C, Ctrl-\, SIGTERM or SIGHUP.
+      - Refuses to start unless all of that holds with the robot standing and the remote
+        idle, AND the robot is localised on the `--from` waypoint it stands on (0.3 m /
+        15 deg), AND the map file is the one the waypoints were captured on (sha1). It
+        holds `/tmp/x2_motion.lock` (shared with loco_cmd_test.py) from before the typed GO
+        (or `--confirm`) until exit. Every exit after preflight ends with 1 s of zeros,
+        sent before anything is printed.
+      - Change `follower_core.py` or `waypoint_follower.py` only with
+        `tools/test_follower.py` AND `tools/test_follower_ros.sh` passing.
     - **Never call `SetMcAction` or `SetMcInputSource`.** Never publish as `rc` (the
       remote must keep priority).
     - **People and space.** Any non-dry run needs an operator holding the controller and
-      clear space.
+      clear space. Losing the laptop link does NOT stop a running `go`; the stick does.
 16. **Never leave a run in `/agibot/data/bag/` uncopied.** It is a ~27 min rolling
     buffer; older segments are gone.
 17. **Never run FASTLIO2_ROS2 `pgo`/`localizer` on the robot's bus unremapped.** Both
