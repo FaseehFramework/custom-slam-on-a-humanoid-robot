@@ -47,10 +47,17 @@ EXTRA_TOPICS=(
   /aima/mc/body_pose
   /aima/mc/locomotion/velocity
   /aima/hal/sensor/lidar_chest_front/lidar_status
-  /aft_mapped_to_init                                   # live Point-LIO output,
-                                                        # present only with live_slam.sh
-  /x2/localization/odometry                             # live localizer output (nav_msgs),
-  /x2/localization/status                               # only with live_slam.sh --localize
+)
+
+# OUR topics (live_slam.sh), standard types. ALWAYS requested, even when absent at preflight:
+# the localizer publishes only once LOCALISED, and Point-LIO only once initialised, which can
+# be after this preflight (shadow_walk_01 lost all three that way). rosbag2 keeps discovering
+# until every requested topic is subscribed, so they are picked up when they appear (tested
+# 2026-10-21). Standard types cannot hit the unloadable-type hazard (CLAUDE.md DO NOT #6).
+OWN_TOPICS=(
+  /aft_mapped_to_init                                   # nav_msgs/Odometry, live Point-LIO
+  /x2/localization/odometry                             # nav_msgs/Odometry, live localizer
+  /x2/localization/status                               # std_msgs/String
 )
 
 # The point cloud alone is ~7.9 MB/s; everything together is ~12 MB/s.
@@ -351,7 +358,8 @@ while IFS='|' read -r t st ty; do
   esac
 done <<< "$VALID"
 
-ok "${#RECORD_TOPICS[@]} topics will be recorded"
+RECORD_TOPICS+=( "${OWN_TOPICS[@]}" )
+ok "${#RECORD_TOPICS[@]} topics will be recorded (incl. ${#OWN_TOPICS[@]} of ours, picked up when they appear)"
 for d in "${DROPPED[@]:-}"; do [[ -n "$d" ]] && warn "dropped: $d"; done
 
 # ----------------------------------------------------------------- start recorder
@@ -407,7 +415,7 @@ EOF
 [[ -n "${RECPID//[^0-9]/}" ]] || die "recorder failed to start; check ${REMOTE_WS}/.rec.log on $HOST"
 
 ok "recorder pid ${RECPID}, subscribed to ${SUBS}/${#RECORD_TOPICS[@]} topics"
-[[ "${SUBS:-0}" -lt "${#RECORD_TOPICS[@]}" ]] && warn "not all topics subscribed yet; check ${REMOTE_WS}/.rec.log if counts look wrong"
+[[ "${SUBS:-0}" -lt "${#RECORD_TOPICS[@]}" ]] && warn "not all topics subscribed yet (normal for our ${#OWN_TOPICS[@]} until live SLAM publishes them); check ${REMOTE_WS}/.rec.log if counts look wrong"
 [[ -n "${SKIPPED// /}" ]] && warn "skipped (unresolvable type): ${SKIPPED}"
 
 # ----------------------------------------------------------------- detached mode
