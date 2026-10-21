@@ -21,17 +21,19 @@ tools/eval_loop_closure.py  drift vs a physically marked start/end (real ground 
 tools/live_slam.sh          start/stop/status live SLAM on the robot
 tools/loco_cmd_test.py      FIRST MOTION TEST (on soc1): tiny velocity command, interlocked
 tools/decode_locomotion_cmd.py  decode recorded locomotion commands (no aimdk typesupport)
-tools/follow.sh             WAYPOINT FOLLOWER from the laptop: mark/list/plan/shadow/go/stop
+tools/follow.sh             WAYPOINT FOLLOWER from the laptop: mark/list/plan/shadow/go/stop/crash
 tools/follower_core.py      follower logic, pure python (caps, gates, legs, watchdogs)
 tools/waypoint_follower.py  follower ROS side on soc1 (run via follow.sh / follow_robot.sh)
-tools/test_follower.py      follower vs simulated robot + mc, every stop path (~20 s)
-tools/test_follower_ros.sh  real follower program vs fake robot node, localhost only (~4 min)
+tools/test_follower.py      follower vs simulated robot + mc, every stop path (~40 s)
+tools/test_follower_ros.sh  real follower program vs fake robot node, localhost only (~6 min)
 tools/test_fixtures/aimdk_msgs_fake/  LAPTOP-ONLY fake vendor types for that test. Never deploy.
 tools/cmd_tracking.py       remote command vs leg-odometry motion (turn sign, lag, speed)
 tools/heading_check.py      turn sign leg-odom vs map; robot heading from map pose vs travel
 RUNBOOK_live_walk.md        step-by-step live walking run (hand to the operator)
 RUNBOOK_mapping_walk.md     mapping walk (both directions) + test walk from the home mark
 RUNBOOK_live_localization.md  live localization walk (operator steps)
+RUNBOOK_waypoints_shadow.md   save waypoints + shadow run of the follower (no motion)
+RUNBOOK_follow_stage_c.md     first follower-driven motion: C1 short leg, C2 crash test, C3 5 m leg
 tools/deploy_nav_robot.sh   sync + build the localizer on soc1 (no GTSAM there), copy maps
 tools/dr_payoff.py          bounds what a leg-odometry DR factor would recover
 tools/offset_sweep.py       start-offset ensemble (DR on/off) -- use before any claim
@@ -96,8 +98,8 @@ ros2 run x2_nav localizer_offline <map.pcd> results/<walk> nav_src/x2_nav/config
 # --- on the robot ---------------------------------------------------------
 ./tools/deploy_nav_robot.sh                   # localizer + maps/map01.pcd -> soc1, build there
 ./tools/live_slam.sh --start --record NAME --localize map01 [--init x,y,z,yaw]
-./tools/follow.sh mark NAME | list | plan A B | shadow A B   # no motion (needs the localizer)
-./tools/follow.sh go A B [--align-final]      # WALKS: operator on the controller, clear space
+./tools/follow.sh mark NAME | list | plan --from S A B | shadow A B   # no motion (needs the localizer)
+./tools/follow.sh go --from S A B [--align-final]   # WALKS: robot ON waypoint S, operator on the controller
 ./tools/follow.sh stop                        # SIGINT a running follower from another terminal
 ./tools/test_follower.py && ./tools/test_follower_ros.sh    # before any follower change ships
 ssh soc1
@@ -162,14 +164,18 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
     - **loco_cmd_test limits.** Caps 0.2 m/s and 3 s, BEST_EFFORT+VOLATILE (no latching),
       5 Hz mode re-check, explicit zeros, then a stop check.
     - **Follower limits, all in code (`follower_core.py`).**
-      - Caps: forward 0..0.2 m/s (never backwards), turn +-0.3 rad/s, sideways 0, legs <= 10 m,
-        a time limit per leg.
+      - Command caps: forward 0..0.2 m/s (never backwards), turn +-0.6 rad/s (in place only;
+        steering while walking <= 0.3), sideways 0, legs <= 10 m, a time limit per leg.
+        **The caps bound the command, not the motion:** mc's walking policy ignores in-place
+        turns below ~0.5 rad/s and turns at ~0.5-1.0 rad/s above it, and walks at ~0.45 m/s for
+        any forward command 0.12-0.2 (README "Stage C1"). The follower stops if the robot
+        moves faster than 0.8 m/s.
       - Stops with zeros and never resumes on any of: stick input from the remote; another
         program publishing as pnc; the remote's stream silent > 1 s; mode not
         STAND/LOCOMOTION_DEFAULT (RUNNING or TRANSITION) or GetMcAction silent > 1 s; pose
         silent > 0.5 s, > 1 s old or not finite; status not TRACKING or silent > 3 s; 8 ICP
-        rejections in a row; a pose jump > 0.4 m or 15 deg; rotating 25 deg against the turn
-        command, walking 0.3 m away, or no progress for 6 s; > 1 m off the leg's line;
+        rejections in a row; a pose jump > 0.4 m or 15 deg; moving faster than 0.8 m/s; rotating
+        25 deg against the turn command, walking 0.3 m away, or no progress for 6 s; > 1 m off the leg's line;
         Ctrl-C, Ctrl-\, SIGTERM or SIGHUP.
       - Refuses to start unless all of that holds with the robot standing and the remote
         idle, AND the robot is localised on the `--from` waypoint it stands on (0.3 m /
