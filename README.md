@@ -2988,15 +2988,191 @@ which says "operator is driving" rather than raising an alarm after a takeover.
 
 ## What the tests cannot show (stages B and C)
 
-- **mc dropping a `pnc` command after 1 s with no zeros following.** Every simulator check of
-  it tests the simulator. Stage C kills the follower mid-walk on purpose.
-- **Whether the remote's stream stops when the PS5 controller is off or out of range.** The
-  heartbeat check assumes so; it was only seen absent in PASSIVE. Stage B: switch the
-  controller off with the robot standing and record.
+- **mc dropping a `pnc` command with no zeros following.** Every simulator check of it tests
+  the simulator. Stage C kills the follower mid-walk on purpose. What mc's own log says
+  (soc0 `/agibot/data/log/log_20261014_104421/mc/`, read 2026-10-21) about the two live tests:
+
+  | | our last non-zero `pnc` | our last zero | mc `has been expired, clear command` |
+  |---|---|---|---|
+  | live test 1 | 11:26:12.300 | 11:26:13.309 | 11:26:13.534 (+1.23 s after the last non-zero) |
+  | live test 2 | 11:33:15.829 | 11:33:16.838 | 11:33:17.084 (+1.26 s after the last non-zero) |
+
+  Our times come from `loco_live_0{1,2}.csv` on soc1; PTP puts both panels on one clock.
+  - **mc does expire `pnc`.** The expiry line does not name the source. But the remote
+    refreshes `rc` at ~49 Hz while connected, so only `pnc` had gone quiet.
+  - **It fired ~1.25 s after the last non-zero command, and only ~0.24 s after our last zero.**
+    So either zeros do not refresh the 1000 ms timeout, or the timer works some other way.
+    Both readings put a mid-walk death at a stop ~1.25 s after the last command. That is
+    still to be shown on the robot (stage C).
+- **The remote's stream when the PS5 controller drops out: answered from the vendor's own log.**
+  - `soc0_rc` (`/agibot/data/log/log_*/rc/rc.log`) logged `Gamepad disconnected` 4 times
+    (2026-10-04, -07, -09, -13).
+  - Each time, 0.4-1.6 s later, it logs `手柄信号断开，直接返回, 不再发布速度消息` ("gamepad
+    signal disconnected, returning; **no longer publishing velocity messages**").
+  - So the follower's "remote silent > 1 s" check detects a dead controller.
+  - mc logged no mode change within a minute of any of the four. What mode the robot was in
+    then is unknown.
+  - The controller-off test proposed for stage B was dropped: the log answers the question,
+    and what a standing robot does when its controller vanishes is unknown.
 - **Pure turn-in-place through `pnc`** (forward 0, angular 0.1-0.3), and speed tracking at a
   steady 0.08-0.2 m/s. Neither has been seen.
 - DDS discovery time on soc1 for the follower's topics, and the GetMcAction round trip at
   5 Hz in Python next to the localizer.
+
+## Stage B (2026-10-21): waypoints + shadow run on the robot. Nothing moved by itself.
+
+**Waypoints** (`maps/map01_waypoints.json` on soc1, map sha1 `e471291933d4`, identical to
+the laptop's `results/map01/map.pcd`):
+
+| name | x | y | heading |
+|---|---|---|---|
+| home | -0.16 | -0.28 | -7.9 deg |
+| office_door | 4.54 | 1.33 | 35.1 deg |
+| desk_entrance | -0.57 | 4.81 | 150.1 deg |
+| seating_guest | -0.56 | 2.07 | 170.2 deg |
+
+All four are in the office. A laptop replay of the same walk agrees with the saved
+positions within 0.5-8.3 cm and 1.5 deg.
+
+**Shadow route** home -> office_door -> desk_entrance -> seating_guest -> home, operator
+driving: COMPLETED in 112 s. Bag `data/bags/shadow_walk_01`, follower logs
+`results/shadow01/`.
+- **The live system was healthy throughout.**
+  - Preflight on soc1 took 1.8 s, DDS discovery included.
+  - Not one pose-stale, status, mode-unknown or remote-silent trip in 112 s. GetMcAction
+    and the remote's stream are both fine on the real bus.
+  - The after-run stop check (leg odometry) read 0.010 m/s.
+- **Turn direction, follower vs operator:** agree 264, disagree 56.
+  - Leg 1: 78/81 agreed; leg 3: 80/80.
+  - The disagreements are where the operator drove differently from the plan: leg 2 while
+    walking (14) and leg 4's first turn (30, the operator turned right where the follower
+    would have turned left).
+- **All 8 WOULD ABORT events are operator driving, not follower faults:**
+
+  | event | cause |
+  |---|---|
+  | `pose jumped 16.4 / 17.3 / 18.4 deg in one update` (x3) | real chest rotation in full-stick turns (1.0 rad/s); leg odometry shows 14-16.6 deg per 0.1 s at those moments, and no ICP correction there exceeded 1.4 deg |
+  | `1.0x m off the straight line` (x3) | operator left the line on legs 2 and 4 (see clearance below) |
+  | `turning: no rotation for 6 s` | operator paused after office_door |
+  | `rotated 32 deg AGAINST the command` | operator turned right, the follower would have gone left |
+
+- **The 15 deg per-update heading-jump limit stays.** Chest heading change per 0.1 s over
+  the whole 11 min session:
+  - no turn command: max 6.2 deg;
+  - turn commands up to 0.35 rad/s (the follower's cap is 0.30): max 6.3 deg, p99 5.6 deg;
+  - 0.6-1.0 rad/s: max 17.9 deg.
+
+**Two legs are blocked** (operator, 2026-10-21: another robot, 126 cm tall, parked in the
+office, and a single-seater sofa, ~70 cm, next to the couch), from a map check of points
+0.25-1.5 m above the local floor within 0.35 m of each straight line:
+- **office_door -> desk_entrance:** a dense cluster 3.0-4.25 m from the door, around 0.7 m
+  high (desk height). The operator's path went around it.
+- **seating_guest -> home:** a dense cluster in the first 0.75 m, around 1.1 m high.
+- **Caveat:** every leg, including the cleanly walked leg 1, also shows a thin uniform
+  background (~50-90 points per 0.25 m). A map-only clearance check is not reliable yet.
+  And one obstacle is a robot that can move: the map cannot be the obstacle authority.
+
+**Localisation at the far end of the office (y ~ 6-7.6): 53 ICP rejections in a row**,
+10:39:41-10:40:33. `mark` refused a waypoint there, correctly, and a follower run would
+stop there.
+- **Cause: Point-LIO's height.** Chest height read +0.46..+0.55 m there. The replay
+  reproduces it (+0.55 m in that minute), and it returns to 0.00 back at home. With
+  `lock_z` the localizer trusts that height, so the scan floats above the map and stops
+  matching.
+- The shadow run itself, in the middle of the office, had 0 rejections. Session total:
+  1173/1230 accepted (95.4 %).
+- **Experiment (replay):** height free during tracking accepts 669/670 vs 617/670 locked.
+  - Horizontal pose vs locked: median 1 cm apart, p95 10 cm, max 33 cm. Which one is right
+    where they differ is not known.
+  - End vs home: locked 3.2 cm behind / 10.4 cm right, free 3.7 / 12.3. Operator: ~7 cm
+    right.
+  - Heading -6 deg vs "facing the right way" by eye: the open heading discrepancy again.
+  - `lock_z` exists for the start-up *search* (a z = +0.52 m rival on marked_loop_02), not
+    for tracking. Candidate change: lock z in the search only. **Not made**; needs the
+    multi-walk check.
+
+**Recorder bug, fixed.** `shadow_walk_01` has no `/x2/localization/*` and no
+`/aft_mapped_to_init`.
+- **Cause:** `record_walk.sh` dropped topics absent at its preflight. The localizer
+  publishes only after LOCALISED, so they were absent.
+- **Fix:** they are now always requested (`OWN_TOPICS`, standard types). rosbag2 subscribes
+  to them when they appear: tested on the laptop, a topic that appeared 4 s after the
+  recorder started was recorded, then "All requested topics are subscribed".
+
+## Stage C1 (2026-10-21): the walking controller does not track small commands
+
+**C1:** `go --from home c1 --fwd-max 0.12`, a 3.06 m leg with a 39 deg left turn first.
+**ABORTED** after 9 s: `turning: no rotation for 6 s`. The stop worked as designed: zeros,
+then leg odometry 0.002 m/s.
+- **mc took the command.** It logged `Set new input: source: pnc`, switched to
+  LOCOMOTION_DEFAULT (`rl_foundationwalk`) and stayed there with no input switch until our
+  zeros. The bag has the pnc stream: ang +0.300 steady.
+- **The robot barely turned.** About 4 deg right in the first 2 s (the stand-to-walk
+  shuffle), 12 deg left in the next 2 s, then **0.001 rad/s** for 4.5 s while stepping.
+
+**Calibration drive, operator, same bag (`data/bags/follow_c_01`).** Leg odometry, cross-checked
+against Point-LIO.
+- **Turn in place, command held about constant for >= 1 s (0.25 s bins): a STEP at ~0.5 rad/s.**
+
+  | \|ang\| command | yaw rate, median |
+  |---|---|
+  | <= 0.20 | 0.000 |
+  | 0.30 (C1, steady) | 0.001 |
+  | 0.40-0.45 | 0.03 |
+  | 0.45-0.50 | 0.11 |
+  | 0.50-0.55 | 0.48 |
+  | 0.55-0.90 | ~0.95 |
+
+  The operator confirms it: "right, barely pushed" (-0.14) gave no response at all.
+- **Walking forward: no slow walk exists.** Stick held at 0.10-0.13 m/s for 7 s:
+  - the first 3 s crept at 0.02-0.09 m/s;
+  - then the robot walked at **0.42-0.51 m/s** while the command stayed at 0.104-0.128
+    (Point-LIO: 0.464 m/s, leg odometry 0.453 over the steady 4 s).
+
+  This matches loc_walk_01 and live_walk_01: commands of 0.1-0.2 gave ~0.4 m/s. Those had
+  been read as deceleration artefacts of an unsteady stick; they were real.
+- **Turning while walking does track small commands:** 0.2-0.3 rad/s gives ~0.27 rad/s
+  (stage B data).
+- **mc's walking-policy config** (`rl/foundationwalk_config.yaml`, read-only) has
+  `cmd_threshold: 0.1`, `vel_yaw_cooldown_speed: 0.25`, `vel_yaw_cooldown_sec: 0.6`,
+  `filter.max_acceleration: 2.0`. The names fit what was measured; what they do exactly is
+  not documented.
+
+**Why the tests did not catch it.** The simulator tracked commands linearly, so it encoded the
+very assumption C1 tested. A reviewer had flagged that class of risk in general.
+
+**Consequences for the follower:**
+- Turning in place needs commands above ~0.5 rad/s, then turns at ~0.5-1.0 rad/s.
+- Any forward command from ~0.12 to 0.2 gives about 0.45 m/s; the 0.2 m/s cap limits the
+  command, not the speed.
+
+**Follower v2 (2026-10-21, operator approved: in-place turn 0.6 rad/s, walking ~0.45 m/s).**
+- **TURN:** a fixed +-0.6 rad/s (turn cap 0.3 -> 0.6, rule #15). The command stops when the
+  remaining angle is under max(15 deg, measured rate x 0.7 s), with the rate taken as at least
+  0.6 rad/s.
+  - Measured carry-on after an in-place release: median 11 deg, max 28 deg, over 6 operator
+    releases at 0.4-1.7 rad/s, i.e. ~0.25-0.4 s. The 0.6 s heading filter adds ~0.3 s.
+  - The cut-off errs short: steering while walking finishes the turn. An overshoot past 30
+    deg would re-turn and oscillate, as the 1.2-1.5 rad/s simulator cases showed before this.
+  - No re-turn for 1.5 s after a turn.
+- **WALK:** one forward command of 0.15 (above mc's 0.1 threshold), steering <= 0.3 rad/s.
+  Forward stops 0.35 m from the goal and the robot coasts in. No slowing near the goal: below
+  0.1, mc stops walking.
+- **New stop:** moving faster than 0.8 m/s over 1 s of poses.
+- **Simulator rebuilt on the measured policy** (in-place step at 0.5, creep then ~0.45 m/s).
+  It reproduces C1 (a policy that ignores the in-place turn ends in `no rotation for 6 s`).
+  - 48+ scenarios, each with and without mc's expiry, plus 300 random routes: all pass.
+    Simulated arrival error median 7.5 cm, p95 16 cm, max 23 cm.
+  - 18 of 19 mutants caught. The survivor removes the 1.5 s no-re-turn window, which the
+    earlier cut-off makes redundant in simulation; kept as margin.
+  - ROS end-to-end: 23/23, with legs lengthened to 3 m so faults land mid-walk.
+- The crash helper now kills 4 s into the walk, past the ~3 s creep, so C2 tests mc's expiry
+  at walking speed.
+
+**Also in this session:** `live_slam.sh --stop` at 11:41:35 ended the localizer (its log
+ends with `signal_handler(signum=2)`). A plain `--start` (no `--localize`) at 11:42:41 then
+ran Point-LIO only, so the calibration has leg odometry and Point-LIO but no map pose. That
+start was still running 20 min later; stopped from the laptop.
 
 # What to record next
 
