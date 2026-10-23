@@ -3004,6 +3004,9 @@ which says "operator is driving" rather than raising an alarm after a takeover.
     So either zeros do not refresh the 1000 ms timeout, or the timer works some other way.
     Both readings put a mid-walk death at a stop ~1.25 s after the last command. That is
     still to be shown on the robot (stage C).
+  - **Answered by C2 (section "Stage C with follower v2"): zeros DO refresh it.** mc clears the
+    command 0.21-0.25 s after our last message of any kind. A follower killed mid-walk was
+    stopped by mc alone.
 - **The remote's stream when the PS5 controller drops out: answered from the vendor's own log.**
   - `soc0_rc` (`/agibot/data/log/log_*/rc/rc.log`) logged `Gamepad disconnected` 4 times
     (2026-10-04, -07, -09, -13).
@@ -3167,12 +3170,118 @@ very assumption C1 tested. A reviewer had flagged that class of risk in general.
     earlier cut-off makes redundant in simulation; kept as margin.
   - ROS end-to-end: 23/23, with legs lengthened to 3 m so faults land mid-walk.
 - The crash helper now kills 4 s into the walk, past the ~3 s creep, so C2 tests mc's expiry
-  at walking speed.
+  at walking speed. (Measured afterwards: at 0.15 there is no 3 s creep, see below. The kill
+  landed at full speed anyway.)
 
 **Also in this session:** `live_slam.sh --stop` at 11:41:35 ended the localizer (its log
 ends with `signal_handler(signum=2)`). A plain `--start` (no `--localize`) at 11:42:41 then
 ran Point-LIO only, so the calibration has leg odometry and Point-LIO but no map pose. That
 start was still running 20 min later; stopped from the laptop.
+
+## Stage C with follower v2 (2026-10-21): C1, C2 (crash) and C3 all clean
+
+Bag `data/bags/follow_c_02` (3.0 GB, with the localization topics). Follower logs in
+`results/stagec/follow_20261021_12*`. mc's log: soc0
+`/agibot/data/log/log_20261021_101001/mc/`. Operator on the controller throughout; **no stick
+input during any run** (the first non-zero `rc` after C2 is at 12:34:27.7, the operator
+driving the robot back).
+
+| run | leg | outcome | stop vs waypoint (map) | operator |
+|---|---|---|---|---|
+| C1 | home -> c1, 3.07 m, turn +49 deg | COMPLETED, 7.3 s | 0.14 m (0.09 short, 0.10 left) | "came to the tape" |
+| C2 | c1 -> home, 3.01 m, turn -156 deg | follower SIGKILLed 3.95 s into the walk (by design) | - | stopped by itself |
+| C3 | home -> office_door, 4.97 m, turn +32 deg | COMPLETED, 13.6 s, one re-turn | 0.11 m (0.06 short, 0.09 left) | at the door (no tape) |
+
+**C2: mc stops a dead follower by itself.**
+- Our last command: 12:34:04.971 (forward 0.15, ang -0.05), the follower's last tick before
+  the SIGKILL. The robot was walking at 0.54 m/s.
+- mc logged `has been expired, clear command` at 12:34:05.185, **+0.21 s**.
+- Leg-odometry speed (0.3 s windows) after our last command: +0.5 s 0.45, +0.75 s 0.24,
+  +1.0 s 0.10, +1.25 s 0.03, one settling step at +1.5 s (0.12), below 0.05 m/s for good at
+  +2.35 s. **It travelled 0.37 m after the last command.**
+- Normal stops with zeros, for comparison: C1 below 0.05 m/s at +1.05 s, 0.27 m; C3 +1.40 s,
+  0.17 m. A dead follower costs ~0.2 s of expiry plus about one extra settling step.
+
+**mc's command expiry, all 8 observed (live tests of 2026-10-14 and C):** it fires 0.21-0.25 s
+after our last message, zeros included. The log stamps all fall on .x34/.x84 s, so mc seems
+to check on a 50 ms cycle.
+
+| when | our last message | expiry | delay |
+|---|---|---|---|
+| live test 1 | 11:26:13.309 (zero) | 11:26:13.534 | 0.225 |
+| live test 2 | 11:33:16.838 (zero) | 11:33:17.084 | 0.246 |
+| C1, end of the zero tail | 12:31:48.452 | 12:31:48.685 | 0.233 |
+| C1, end of the exit zeros | 12:31:52.461 | 12:31:52.685 | 0.224 |
+| C2, follower stall (below) | 12:33:57.421 | 12:33:57.635 | 0.214 |
+| C2, SIGKILL | 12:34:04.971 | 12:34:05.185 | 0.214 |
+| C3, end of the zero tail | 12:35:30.361 | 12:35:30.585 | 0.224 |
+| C3, end of the exit zeros | 12:35:34.405 | 12:35:34.635 | 0.230 |
+
+**Walking at forward 0.15: no 3 s creep.** The walk reaches 0.3 m/s 0.55-0.70 s after the
+first forward command (4 walk starts), then runs at 0.45-0.6 m/s (leg odometry, 0.4 s
+windows). The highest speed over 1 s of map poses was 0.56 m/s in every run (stop at 0.8). The
+3 s creep of the calibration drive was at 0.10-0.13, near mc's 0.1 threshold.
+
+**Arrival heading.** The follower arrives facing the way it walked; it turns to the waypoint's
+saved heading only with `--align-final`.
+- After C1 the robot stood at 51.4 deg in the map.
+- The operator then placed it on the c1 tape facing the arrow: 12.1 deg (C2 preflight). When
+  c1 was marked: 3.3 deg.
+- So the map puts the arrival 39-48 deg left of the arrow; the operator judged ~30 deg by eye.
+- The two hand placements on the same tape differ by 9 deg (within the 15 deg start check).
+
+**C3: an uncommanded sidestep and 44 deg left turn while walking, ~1.4 m before the door.**
+- 12:35:23.9-24.5 (turning centre about (2.94, 0.49) -> (3.06, 0.75)): the chest moved 30-45 deg
+  to the LEFT of where it faced (travel 58-74 deg, heading 25-30 deg). No sideways command
+  exists (`lateral` is always 0); steering was +0.06 -> -0.07.
+- 12:35:24.5-25.0: heading 24.5 -> 68.8 deg. Leg odometry shows the same turn to within 3 deg,
+  so it is real motion, not a localization jump. The waist yaw stayed within +-11 deg and
+  both hip yaws swung: the legs turned, not just the torso.
+- The follower re-turned (`-33 deg off`). The right turn carried on LEFT another 13 deg before
+  it took (heading 49 -> 62 deg); the "25 deg against the command" stop was not reached.
+  It then walked on and arrived 0.11 m from the waypoint.
+- **Cause unknown.** Not seen on the other legs. Candidates: something on the floor there, a
+  foot slip. Ask the operator what is on the floor at that spot.
+
+**C2: steering had no visible effect for the first ~1.5 s of the walk.**
+- The turn stopped 20 deg short (-124 vs -144 deg), as designed.
+- Steering -0.12..-0.27 for 1.5 s: heading -134 -> -124 -> -130 deg, while walking at
+  0.35-0.54 m/s. Then it tracked: -130 -> -156 deg in 1.5 s (~0.3 rad/s).
+- The robot walked 0.6 m off the line (fence 1 m) before steering took hold.
+- C1 (turn stopped 25 deg short) and C3 (22 deg short) peaked at 0.37 and 0.36 m off the line.
+
+**One follower loop stall: 0.343 s.**
+- C2, 12:33:57.42, 0.45 s after the first command, during the stand -> walk switch. The CSV
+  shows the missed ticks then ran back to back.
+- mc expired the turn command 0.21 s into the gap, so the turn was dropped for ~0.13 s.
+- **Rare:** 1 gap over 75 ms in ~2,580 ticks (stage B shadow, both C1s, C2, C3; the shadow
+  run's 2 s gaps are its own hold-off). The other gaps were at most 57 ms.
+- **Cause not identified.** Candidates: the CSV write on the control thread (the disk was
+  taking a 3 GB recording), CPU scheduling on the Orin, Python's garbage collector. None is
+  measured.
+- **It fails safe** (mc stops the robot), but mid-walk it would make the robot start to stop.
+
+**C4 (2026-10-22): two legs and the first final align, clean.**
+`go --from home c1 office_door --align-final`, bag `data/bags/follow_c_03` (1.3 GB), log
+`results/stagec/follow_20261022_100750_16542.*`. COMPLETED; no stick input, peak 0.57 m/s, no
+loop stall (no tick gap over 75 ms inside a leg). Operator: "it went so good".
+
+| | stop vs waypoint (map) | turn: stopped short / carried on | max off the line |
+|---|---|---|---|
+| leg 1, home -> c1 (turn +52 deg) | 0.22 m (0.08 short, 0.21 left) | 32 deg / 19 deg | 0.29 m |
+| leg 2, c1 -> office_door (turn -49 deg) | 0.21 m (0.03 short, 0.20 right) | 26 deg / 14 deg | 0.20 m |
+
+- **Between legs** it stood 3.9 s at c1 (zeros, wait for STAND, 1 s measurement), as designed.
+- **Align at the door:** it starts at the 0.35 m trigger, while the robot still coasts. The
+  turn command (+0.6) ran 0.7 s: heading -10.9 -> 10.4 deg, then carried on 16 deg to 26.8 deg.
+  **It ended 8.3 deg short** of the saved 35.15 deg.
+- No drift like C2's after either turn (both ~50 deg).
+
+**Where the stop error comes from, all 4 arrivals so far.** After the forward cut the robot
+coasts 0.21-0.34 m, in a direction 18-27 deg off its heading, to either side (C1 +18, C3 -20,
+C4 c1 +27, C4 door -24). The along-track error is small (-0.03 to -0.09 m), so the 0.35 m
+trigger fits. **The sideways error (0.09-0.21 m) is now the main error.** All 4 arrivals are
+within 0.22 m by the map.
 
 # What to record next
 

@@ -167,9 +167,11 @@ ros2 topic list --no-daemon                   # --no-daemon is MANDATORY
       - Command caps: forward 0..0.2 m/s (never backwards), turn +-0.6 rad/s (in place only;
         steering while walking <= 0.3), sideways 0, legs <= 10 m, a time limit per leg.
         **The caps bound the command, not the motion:** mc's walking policy ignores in-place
-        turns below ~0.5 rad/s and turns at ~0.5-1.0 rad/s above it, and walks at ~0.45 m/s for
-        any forward command 0.12-0.2 (README "Stage C1"). The follower stops if the robot
+        turns below ~0.5 rad/s and turns at ~0.5-1.0 rad/s above it, and walks at ~0.45-0.55 m/s
+        for any forward command 0.12-0.2 (README "Stage C1"). The follower stops if the robot
         moves faster than 0.8 m/s.
+      - A killed follower: mc drops the command 0.21-0.25 s after the last message (zeros
+        refresh it). Measured in C2: stopped within ~1.3 s, 0.37 m (README "Stage C with v2").
       - Stops with zeros and never resumes on any of: stick input from the remote; another
         program publishing as pnc; the remote's stream silent > 1 s; mode not
         STAND/LOCOMOTION_DEFAULT (RUNNING or TRANSITION) or GetMcAction silent > 1 s; pose
